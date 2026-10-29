@@ -1,0 +1,6 @@
+# macOS: python3 -m pip install -r requirements-mac.txt
+pillow>=10.3
+# Необязательно: глобальная горячая клавиша Cmd+Option+P (нужен доступ «Универсальный доступ»)
+pynput
+# Необязательно: несколько мониторов, точный учёт буфера обмена и активного приложения
+pyobjc-framework-Cocoa

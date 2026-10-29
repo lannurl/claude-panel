@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+*.log
+Thumbs.db
+.DS_Store
+# личные настройки (пример — config.example.json)
+config.json
+# снимки самотестов (кроме скриншота для README)
+*.png
+!docs/screenshot.png

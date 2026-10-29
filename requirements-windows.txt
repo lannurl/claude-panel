@@ -1,0 +1,8 @@
+# Windows: python -m pip install -r requirements-windows.txt
+pillow>=10.3
+# «Что играет» — медиа-центр Windows (SMTC). Нижние границы — проверенные версии.
+winrt-runtime>=4.0.3
+winrt-Windows.Media.Control>=4!10.0.28000.2705
+winrt-Windows.Foundation>=4!10.0.28000.2705
+winrt-Windows.Foundation.Collections>=4!10.0.28000.2705
+winrt-Windows.Storage.Streams>=4!10.0.28000.2705
