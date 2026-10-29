@@ -1,3 +1,8 @@
 {
-  "main_agent_name": "Claude"
+  "main_agent_name": "Claude",
+  "notify": {"done": true, "permission": true, "sound": true},
+  "servers": [
+    {"name": "файл-сервер", "host": "192.0.2.10", "ssh": "admin@192.0.2.10", "ssh_port": 22},
+    {"name": "роутер", "host": "192.0.2.1"}
+  ]
 }

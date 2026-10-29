@@ -610,3 +610,170 @@ def window_minimized(h):
 
 def focus_window(h):
     return None
+
+
+# ── Файлы: открыть / показать в Finder ──
+def _existing_path(path):
+    """Нормализованный абсолютный путь к существующему файлу/папке или (None, текст ошибки)."""
+    if not isinstance(path, (str, os.PathLike)):
+        return None, "Некорректный путь"
+    p = os.fspath(path)
+    if not p or "\x00" in p or len(p) > 4096:
+        return None, "Некорректный путь"
+    p = os.path.normpath(p)
+    if not os.path.isabs(p):  # абсолютный путь начинается с «/» — open не примет его за ключ
+        return None, "Нужен абсолютный путь"
+    if not os.path.exists(p):
+        return None, "Файл не найден"
+    return p, None
+
+
+def _spawn(args, what):
+    try:
+        subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return None
+    except OSError as e:
+        log(f"{what}: {type(e).__name__}")
+        return "Не удалось открыть"
+
+
+def open_path(path):
+    """Открыть файл/папку программой по умолчанию (open). None — успех, иначе текст ошибки."""
+    p, err = _existing_path(path)
+    return err or _spawn(["open", p], "open_path")
+
+
+def reveal_path(path):
+    """Показать файл/папку в Finder с выделением (open -R). None — успех."""
+    p, err = _existing_path(path)
+    return err or _spawn(["open", "-R", p], "reveal_path")
+
+
+# ── Звук уведомления ──
+_NOTIFY_SOUND = "/System/Library/Sounds/Glass.aiff"
+
+
+def notify_sound():
+    """Короткий тихий системный звук в фоне. Исключений не бросает."""
+    try:
+        if os.path.exists(_NOTIFY_SOUND):
+            subprocess.Popen(["afplay", "-v", "0.5", _NOTIFY_SOUND], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"notify_sound: {type(e).__name__}")
+
+
+# ── Снимок экрана (нужно разрешение «Запись экрана», иначе в кадре будут только обои) ──
+def _tmp_png():
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="mypanel-", suffix=".png")
+    os.close(fd)
+    return path
+
+
+def _load_and_remove(path):
+    from PIL import Image
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return None
+        with Image.open(path) as im:
+            im.load()
+            return im.copy()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def capture_region_native():
+    """Системное выделение области (screencapture -i). PIL.Image или None, если отменили (Esc) / ошибка.
+
+    Блокирует до конца выделения — вызывать из фонового потока. Окно панели лучше спрятать заранее.
+    """
+    path = _tmp_png()
+    try:
+        subprocess.run(["screencapture", "-i", "-x", path], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"screencapture -i: {type(e).__name__}")
+    try:
+        return _load_and_remove(path)
+    except Exception as e:
+        log(f"screencapture -i: чтение {type(e).__name__}")
+        return None
+
+
+def grab(bbox):
+    """Снимок области (left, top, right, bottom) в координатах tk (пункты). Картинка — в физических
+    пикселях экрана (на Retina вдвое больше bbox). Ошибка — исключение, как у PIL.ImageGrab."""
+    left, top, right, bottom = (int(v) for v in bbox)
+    if right <= left or bottom <= top:
+        raise ValueError("пустая область снимка")
+    path = _tmp_png()
+    try:
+        subprocess.run(["screencapture", "-x", "-R", f"{left},{top},{right - left},{bottom - top}", path],
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise OSError(f"screencapture: {type(e).__name__}") from e
+    im = _load_and_remove(path)
+    if im is None:
+        raise OSError("screencapture не сохранил снимок")
+    return im
+
+
+# ── Картинка в буфере обмена ──
+def set_clipboard_image(img):
+    """Положить картинку PIL в буфер (PNG + TIFF через NSPasteboard; без pyobjc — osascript). True — получилось."""
+    import io
+    try:
+        png = io.BytesIO()
+        (img if img.mode in ("RGB", "RGBA", "L", "LA", "P") else img.convert("RGB")).save(png, "PNG")
+        png = png.getvalue()
+    except Exception as e:
+        log(f"set_clipboard_image: подготовка {type(e).__name__}")
+        return False
+    ak = _AppKit()
+    if ak:
+        try:
+            tiff = io.BytesIO()
+            img.convert("RGBA").save(tiff, "TIFF")  # TIFF — «родной» формат картинок буфера macOS
+            tiff = tiff.getvalue()
+            pb = ak.NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            ok = pb.setData_forType_(ak.NSData.dataWithBytes_length_(png, len(png)), ak.NSPasteboardTypePNG)
+            pb.setData_forType_(ak.NSData.dataWithBytes_length_(tiff, len(tiff)), ak.NSPasteboardTypeTIFF)
+            if ok:
+                return True
+        except Exception as e:
+            log(f"set_clipboard_image: NSPasteboard {type(e).__name__}")
+    path = _tmp_png()
+    try:
+        with open(path, "wb") as f:
+            f.write(png)
+        out = osa(f"set the clipboard to (read (POSIX file {_as_str(path)}) as «class PNGf»)\nreturn \"ok\"",
+                  timeout=5)
+        return out == "ok"
+    except OSError as e:
+        log(f"set_clipboard_image: {type(e).__name__}")
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def clipboard_image():
+    """Картинка из буфера (PIL.ImageGrab.grabclipboard умеет macOS) или None."""
+    try:
+        from PIL import Image, ImageGrab
+        im = ImageGrab.grabclipboard()
+        return im if isinstance(im, Image.Image) else None
+    except Exception as e:
+        log(f"clipboard_image: {type(e).__name__}")
+        return None

@@ -370,3 +370,172 @@ def focus_window(h):
     if user32.IsIconic(h):
         user32.ShowWindow(h, 9)  # SW_RESTORE
     user32.SetForegroundWindow(h)
+
+
+# ── Файлы: открыть / показать в Проводнике ──
+def _existing_path(path):
+    """Нормализованный абсолютный путь к существующему файлу/папке или (None, текст ошибки)."""
+    if not isinstance(path, (str, os.PathLike)):
+        return None, "Некорректный путь"
+    p = os.fspath(path)
+    if not p or "\x00" in p or len(p) > 32767:
+        return None, "Некорректный путь"
+    p = os.path.normpath(p)  # explorer понимает только обратные слэши
+    if not os.path.isabs(p):
+        return None, "Нужен абсолютный путь"
+    if not os.path.exists(p):
+        return None, "Файл не найден"
+    return p, None
+
+
+def open_path(path):
+    """Открыть файл/папку программой по умолчанию. None — успех, иначе текст ошибки."""
+    p, err = _existing_path(path)
+    if err:
+        return err
+    try:
+        os.startfile(p)
+        return None
+    except OSError as e:
+        log(f"open_path: {type(e).__name__} winerror={getattr(e, 'winerror', None)}")
+        return "Не удалось открыть: нет программы для этого типа файла" if getattr(e, "winerror", 0) == 1155 \
+            else "Не удалось открыть файл"
+
+
+def reveal_path(path):
+    """Показать файл/папку в Проводнике с выделением (explorer /select,<path>). None — успех."""
+    p, err = _existing_path(path)
+    if err:
+        return err
+    try:
+        # аргументы списком: list2cmdline даёт  explorer /select, "C:\путь с пробелами\файл"
+        subprocess.Popen(["explorer", "/select,", p], creationflags=0x08000000)
+        return None
+    except OSError as e:
+        log(f"reveal_path: {type(e).__name__}")
+        return "Не удалось открыть Проводник"
+
+
+# ── Звук уведомления ──
+def notify_sound():
+    """Короткий системный звук «Уведомление» (асинхронно, не блокирует). Исключений не бросает."""
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+    except Exception as e:
+        log(f"notify_sound: {type(e).__name__}")
+
+
+# ── Снимок экрана ──
+def capture_region_native():
+    """На Windows выделение области делает панель своим оверлеем — системного средства нет."""
+    return NotImplemented
+
+
+def grab(bbox):
+    """Снимок области (left, top, right, bottom) в физических пикселях, со всех мониторов."""
+    from PIL import ImageGrab
+    left, top, right, bottom = (int(v) for v in bbox)
+    if right <= left or bottom <= top:
+        raise ValueError("пустая область снимка")
+    return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+
+
+# ── Картинка в буфере обмена ──
+_cb_user32.EmptyClipboard.restype = wintypes.BOOL
+_cb_user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+_cb_user32.SetClipboardData.restype = wintypes.HANDLE
+_cb_user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+_cb_user32.CreateWindowExW.restype = wintypes.HWND
+_cb_user32.DestroyWindow.argtypes = [wintypes.HWND]
+_cb_user32.DestroyWindow.restype = wintypes.BOOL
+_cb_kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+_cb_kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+_cb_kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+_cb_kernel32.GlobalFree.restype = wintypes.HGLOBAL
+_CF_DIB = 8
+_CF_PNG = _cb_user32.RegisterClipboardFormatW("PNG")  # браузеры/Telegram/Office берут PNG с прозрачностью
+_GMEM_MOVEABLE = 0x0002
+_IMG_LIMIT = 256 * 1024 * 1024  # больше 256 МБ в буфер не кладём
+
+
+def _global_from_bytes(data):
+    h = _cb_kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
+    if not h:
+        return None
+    p = _cb_kernel32.GlobalLock(h)
+    if not p:
+        _cb_kernel32.GlobalFree(h)
+        return None
+    try:
+        ctypes.memmove(p, data, len(data))
+    finally:
+        _cb_kernel32.GlobalUnlock(h)
+    return h
+
+
+def set_clipboard_image(img):
+    """Положить картинку PIL в буфер обмена (CF_DIB + PNG). True — получилось."""
+    import io
+    try:
+        rgb = img.convert("RGB")
+        bmp = io.BytesIO()
+        rgb.save(bmp, "BMP")
+        dib = bmp.getvalue()[14:]  # CF_DIB — BMP без 14-байтного BITMAPFILEHEADER
+        png = io.BytesIO()
+        (img if img.mode in ("RGB", "RGBA", "L", "LA", "P") else rgb).save(png, "PNG")
+        png = png.getvalue()
+    except Exception as e:
+        log(f"set_clipboard_image: подготовка {type(e).__name__}")
+        return False
+    if len(dib) + len(png) > _IMG_LIMIT:
+        log("set_clipboard_image: картинка слишком большая")
+        return False
+    # Окно-владелец (message-only): с OpenClipboard(NULL) SetClipboardData по документации может не сработать
+    hwnd = _cb_user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, wintypes.HWND(-3), None, None, None)
+    try:
+        for _ in range(10):  # буфер может быть ненадолго занят другой программой
+            if _cb_user32.OpenClipboard(hwnd):
+                break
+            time.sleep(0.03)
+        else:
+            log("set_clipboard_image: буфер занят")
+            return False
+        try:
+            if not _cb_user32.EmptyClipboard():
+                return False
+            ok = False
+            for fmt, data in ((_CF_DIB, dib), (_CF_PNG, png)):
+                if not fmt:
+                    continue
+                h = _global_from_bytes(data)
+                if not h:
+                    continue
+                if _cb_user32.SetClipboardData(fmt, h):
+                    ok = ok or fmt == _CF_DIB  # память теперь принадлежит системе
+                else:
+                    _cb_kernel32.GlobalFree(h)
+            if not ok:
+                log(f"set_clipboard_image: SetClipboardData, ошибка {ctypes.get_last_error()}")
+            return ok
+        finally:
+            _cb_user32.CloseClipboard()
+    except Exception as e:
+        log(f"set_clipboard_image: {type(e).__name__}")
+        return False
+    finally:
+        if hwnd:
+            _cb_user32.DestroyWindow(hwnd)
+
+
+def clipboard_image():
+    """Картинка из буфера обмена (PIL.Image) или None (там текст, файлы, пусто, ошибка)."""
+    try:
+        from PIL import Image, ImageGrab
+        im = ImageGrab.grabclipboard()
+        return im if isinstance(im, Image.Image) else None
+    except Exception as e:
+        log(f"clipboard_image: {type(e).__name__}")
+        return None
