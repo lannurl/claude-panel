@@ -250,6 +250,27 @@ def virtual_display_present(displays, match=None):
 
 
 # ── валидация и argv ──
+def moonlight_pids(own_pid=None):
+    """Запущенные Moonlight (в т.ч. открытые вручную). Только чтение списка процессов."""
+    pids = []
+    try:
+        if os.name == "nt":
+            rc, out = D._run(["tasklist", "/FI", "IMAGENAME eq moonlight.exe", "/FO", "CSV", "/NH"], timeout=8)
+            for ln in (out or "").splitlines():
+                m = re.match(r'^"moonlight\.exe","(\d+)"', ln.strip(), re.I)
+                if m:
+                    pids.append(int(m.group(1)))
+        else:
+            rc, out = D._run(["ps", "-A", "-o", "pid=", "-o", "comm="], timeout=5)
+            for ln in (out or "").splitlines():
+                m = re.match(r"\s*(\d+)\s+(.+)$", ln)
+                if m and os.path.basename(m.group(2).strip()).lower() in MOONLIGHT_NAMES:
+                    pids.append(int(m.group(1)))
+    except Exception as e:
+        log(f"moonlight_pids: {type(e).__name__}")
+    return [p for p in pids if p != own_pid]
+
+
 def valid_host(h):
     if not isinstance(h, str) or not h or h[0] == "-" or not D.HOST_RE.fullmatch(h):
         return False

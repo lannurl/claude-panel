@@ -686,6 +686,7 @@ class MonitorsCtl:
     def _job_shared(self, server_id, from_peer=True):
         try:
             self._begin_leave_monitor()
+            self._stop_stray_stream()
             try:
                 res = self._start_shared(server_id)
             except (ValueError, OSError) as e:
@@ -718,6 +719,7 @@ class MonitorsCtl:
     def _job_off(self, from_peer=True):
         try:
             self._begin_leave_monitor()
+            self._stop_stray_stream()
             self._stop_df()
             with self._lock:
                 self._mode, self._df_err = "off", None
@@ -1235,7 +1237,15 @@ class MonitorsCtl:
                     else "Moonlight не запущен")
         if running:
             hint = None
+        stray = None
+        if mode != "monitor" and role == "host":
+            with self._lock:
+                stray = S.virtual_display_present(self._displays, self._vmatch())
+            if stray:
+                hint = (f"{self._mname(self._peer_id())} ещё показывает экран (Moonlight открыт вне режима). "
+                        f"Нажмите там «Выкл» или закройте Moonlight; со связкой это делается само.")
         return {"running": running, "role": role, "waiting": mode == "monitor" and not running,
+                "stray_stream": bool(stray),
                 "virtual_display": (vd.get("label") or vd.get("gdi_name")) if vd else None,
                 "positioned": bool(pos and vd is not None), "virtual_screen": self._virtual_screen_id(),
                 "app_name": self._stream_cfg().get("app_name"), "err": err, "hint": hint}
@@ -1366,6 +1376,28 @@ class MonitorsCtl:
             self._stream_err = self._stream_hint = None
             self._vd_positioned, self._vd_fail_key = False, None
         self._rebuild_rules()   # без VD
+
+    def _stop_stray_stream(self):
+        """Не в режиме monitor картинки быть не должно: клиент закрывает любой Moonlight, даже открытый вручную
+        (`quit` у хоста закрывает сеанс Apollo и виртуальный экран)."""
+        if self._role() != "client":
+            return
+        with self._lock:
+            moon = self._moon
+        own = moon.status().get("pid") if moon is not None else None
+        stray = S.moonlight_pids(own)
+        if not stray:
+            return
+        mf = self._moon_find or {}
+        host = self._layout.machine(self._host_id()) if self._layout else None
+        if mf.get("ok") and host is not None and S.valid_host(host.host or ""):
+            try:
+                self._ensure_moon().stop(host.host)
+            except Exception as e:
+                log(f"stray quit: {type(e).__name__}")
+        for pid in S.moonlight_pids(own):
+            D._kill_pid(pid, False)
+        log(f"закрыт Moonlight вне режима monitor: {len(stray)}")
 
     def _monitor_precheck(self):
         lay = self._layout

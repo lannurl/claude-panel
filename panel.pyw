@@ -14,7 +14,8 @@
 (hotkey по умолчанию: Windows — true, macOS — false).
 
 Лимиты: токен входа Claude Code читается из ~/.claude/.credentials.json (на macOS — из Связки ключей)
-и отправляется только на api.anthropic.com (тот же запрос, что делает /usage). История буфера — только в памяти.
+и отправляется только на api.anthropic.com (тот же запрос, что делает /usage). История буфера хранится в %LOCALAPPDATA%/MyPanel/clipboard (только у этого пользователя) и переживает
+перезапуск; пароли из менеджеров паролей туда не попадают.
 """
 import dataclasses
 import hashlib
@@ -830,6 +831,8 @@ class Panel:
         self.anim = None
         self.tab = {"server": "net"}.get(test_tab, test_tab) or "sessions"  # «server» — старое имя вкладки
         self.history, self.paused = [], False
+        self.clip_persist, self.clip_save_job = test_tab is None, None
+        self.clip_load()
         self.clip_seq = plat.clipboard_seq(self.root)
         self.sessions, self.sess_sig, self.hits = [], None, []
         self.scroll_pos, self.ago_labels = {}, []
@@ -1151,6 +1154,9 @@ class Panel:
         threading.Thread(target=work, daemon=True).start()
 
     def quit(self):
+        if self.clip_save_job is not None:   # отложенное сохранение истории буфера — сейчас
+            self.root.after_cancel(self.clip_save_job)
+            self.clip_save()
         if self.monitor:
             try:
                 self.monitor.stop()
@@ -1750,6 +1756,69 @@ class Panel:
         self.history = [h for h in self.history if h[0] != text]
         self.history.insert(0, (text, time.time()))
         del self.history[HISTORY_MAX:]
+        self.clip_save_later()
+
+    # ── История буфера на диске: переживает перезапуск панели ──
+    def clip_dir(self):
+        d = getattr(plat, "DATA_DIR", None)
+        return Path(d) / "clipboard" if d else None
+
+    def clip_load(self):
+        d = self.clip_dir() if self.clip_persist else None
+        if d is None:
+            return
+        try:
+            data = json.loads((d / "history.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        items = []
+        for e in data.get("items", [])[:HISTORY_MAX] if isinstance(data, dict) else []:
+            try:
+                ts = float(e.get("ts") or 0)
+                if e.get("kind") == "text" and isinstance(e.get("text"), str):
+                    items.append((e["text"], ts))
+                elif e.get("kind") == "image" and re.fullmatch(r"[0-9a-f]{32}", str(e.get("file", ""))):
+                    with Image.open(d / f"{e['file']}.png") as im:
+                        im.load()
+                        item = ClipImage(im, str(e.get("label") or "картинка"))
+                    items.append((item, ts))
+            except Exception as ex:
+                plat.log(f"clip_load: {type(ex).__name__}")
+        self.history = items
+
+    def clip_save_later(self):
+        if not self.clip_persist:
+            return
+        if self.clip_save_job is not None:
+            self.root.after_cancel(self.clip_save_job)
+        self.clip_save_job = self.root.after(1500, self.clip_save)
+
+    def clip_save(self):
+        self.clip_save_job = None
+        d = self.clip_dir() if self.clip_persist else None
+        if d is None:
+            return
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            out, keep = [], set()
+            for item, ts in self.history:
+                if isinstance(item, ClipImage):
+                    name = item.key[2].hex()
+                    f = d / f"{name}.png"
+                    if not f.exists():
+                        item.img.save(f, "PNG", compress_level=1)
+                    keep.add(f.name)
+                    out.append({"kind": "image", "file": name, "label": item.label.rsplit(" ", 1)[0], "ts": ts})
+                else:
+                    out.append({"kind": "text", "text": item, "ts": ts})
+            tmp = d / "history.json.tmp"
+            tmp.write_text(json.dumps({"v": 1, "items": out}, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, d / "history.json")
+            for f in d.glob("*.png"):   # удалённые из истории картинки — с диска тоже
+                if f.name not in keep:
+                    f.unlink()
+        except OSError as e:
+            plat.log(f"clip_save: {type(e).__name__}")
 
     def push_image(self, img, label):
         """Картинка в историю (дубль поднимается наверх). Не больше IMG_MAX картинок и IMG_BUDGET байт."""
@@ -1769,6 +1838,7 @@ class Panel:
                     continue  # старые картинки уходят первыми
             keep.append(h)
         self.history = keep[:HISTORY_MAX]
+        self.clip_save_later()
         return item
 
     def copy_image(self, item):
@@ -1923,10 +1993,12 @@ class Panel:
 
     def clip_clear(self):
         self.history.clear()
+        self.clip_save()
         self.set_tab("clip")
 
     def clip_del(self, i):
         self.history.pop(i)
+        self.clip_save()
         self.set_tab("clip")
 
     # ── Уведомления: «Claude закончил» и «ждёт разрешения» ──
@@ -3465,7 +3537,9 @@ class Panel:
         peer = self.mon_peer_id()
         peer_name = self.mon_machine_name(peer) if peer else "второй ноут"
         role = st.get("role")
-        if mode != "monitor":
+        if mode != "monitor" and st.get("stray_stream"):
+            text, fg = "● Картинка идёт вне режима — закрой Moonlight на втором ноуте", C["red"]
+        elif mode != "monitor":
             text, fg = "○ Выключено", C["ink"]
         elif st.get("err"):
             text, fg = "● Ошибка", C["red"]

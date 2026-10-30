@@ -234,6 +234,7 @@ class TestMonitorsCtl(unittest.TestCase):
                    mock.patch.object(stream_ctl, "find_host_app", return_value=dict(APOLLO_OK)),
                    mock.patch.object(stream_ctl, "find_moonlight", return_value=dict(MOON_OK)),
                    mock.patch.object(stream_ctl, "Moonlight", FakeMoon),
+                   mock.patch.object(stream_ctl, "moonlight_pids", return_value=[]),
                    mock.patch.object(peer_link, "PeerLink", FakeLink)):
             pt.start()
             self.addCleanup(pt.stop)
@@ -690,6 +691,7 @@ class TestMonitorsCtl(unittest.TestCase):
         self.ctl.set_this_machine(me)
         self.wait_until(lambda: self.ctl.snapshot()["components"]["apollo"]["state"] != "na"
                         or self.ctl.snapshot()["components"]["moonlight"]["state"] != "na", what="find")
+        self.wait_until(lambda: not self.ctl.snapshot().get("busy"), what="idle")
         r = self.ctl.set_mode("monitor")
         self.assertTrue(r["ok"], r)
         return self.wait_mode("monitor")
@@ -905,6 +907,13 @@ class TestMonitorsCtl(unittest.TestCase):
         self.assertEqual(moon.calls[-1], ("stop", "192.0.2.11"))
         self.assertEqual(FakeDF.instances[0].calls[-1][0], "client")
         self.assertEqual(self.ctl.snapshot()["server"], "a")
+
+    def test_off_closes_stray_moonlight_on_client(self):
+        self.ctl.set_this_machine("b") if hasattr(self.ctl, "set_this_machine") else None
+        with mock.patch.object(stream_ctl, "moonlight_pids", side_effect=[[4242], [4242]]),                 mock.patch.object(deskflow_ctl, "_kill_pid") as kill:
+            self.ctl._this = "b"
+            self.ctl._stop_stray_stream()
+        kill.assert_called_once_with(4242, False)
 
     def test_leave_monitor_restores_previous_mode(self):
         self.ctl.set_this_machine("b")
