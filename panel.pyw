@@ -3798,14 +3798,13 @@ class Panel:
         snap = self.mon_snap
         mode = snap.get("mode") or "off"
         df_text, df_col = self.mon_comp("deskflow")
-        subs = {"off": ("только свои экраны", C["muted"]),
-                "shared": (f"Deskflow: {df_text}", df_col),
-                "monitor": (f"Apollo: {self.mon_comp('apollo')[0]} · Moonlight: {self.mon_comp('moonlight')[0]}",
-                            C["muted"])}
+        subs = {"off": ("всё выкл · мышь у каждого своя", C["muted"]),
+                "shared": (f"мышь на оба ноута · {df_text}", df_col),
+                "monitor": ("ноут B — 2-й экран (расширение)", C["muted"])}
         for key, (cell, t, sub) in ui["modes"].items():
             on = key == mode
             cell.configure(highlightbackground=C["accent"] if on else C["item"])
-            t.configure(fg=C["accent"] if on else (C["muted"] if key == "monitor" else C["ink"]))
+            t.configure(fg=C["accent"] if on else C["ink"])
             sub.configure(text=subs[key][0], fg=subs[key][1])
         pend = snap.get("os_positions_pending")  # плашка отката переживает перестройку вкладки
         if isinstance(pend, dict) and pend.get("token") and not self.mon_pending:
@@ -3813,14 +3812,14 @@ class Panel:
         if snap.get("busy"):
             ui["mode_line"].configure(text=snap.get("busy_text") or "Выполняю…", fg=C["accent"])
         elif mode == "shared":
-            ui["mode_line"].configure(text="Курсор уходит на другой компьютер через край по схеме ниже — по реальным "
-                                           "размерам экранов.", fg=C["muted"])
+            ui["mode_line"].configure(text="Общая мышь: одна мышь и клавиатура на оба ноута, курсор уходит через край "
+                                           "по схеме. Ноут B работает как отдельный ноут.", fg=C["muted"])
         elif mode == "monitor":
-            ui["mode_line"].configure(text="Ноут B — второй монитор этого компьютера; стоит там, где он на схеме.",
+            ui["mode_line"].configure(text="Ноут как монитор: ноут B — второй экран (расширение), стоит там, где он на схеме.",
                                       fg=C["muted"])
         else:
-            ui["mode_line"].configure(text="«Общая мышь» — одна мышь и клавиатура на два компьютера. «Ноут как монитор» "
-                                           "— ноут B становится вторым экраном.", fg=C["muted"])
+            ui["mode_line"].configure(text="Выкл: всё остановлено, у каждого ноута своя мышь. Режим переключается сразу "
+                                           "на обоих ноутах (если есть связка).", fg=C["muted"])
         self.mon_paint_shared()
         self.mon_paint_stream()
         self.mon_paint_edge()
