@@ -127,6 +127,7 @@ class TestBuild(unittest.TestCase):
             "[core]\ncoreMode=2\ncomputerName=laptop-a\ninterface=192.168.0.101\nport=24800\n"
             "[security]\ntlsEnabled=true\ncertificate=C:/Users/u/tls/deskflow.pem\ncheckPeerFingerprints=true\n"
             "[server]\nexternalConfig=true\nexternalConfigFile=C:/d/server.conf\nenableClipboard=true\n"
+            "disableLockToComputer=true\n"
             "[log]\nlevel=DEBUG\n"
             "[computer_laptop-a]\nname=laptop-a\n[computer_laptop-b]\nname=laptop-b\n"))
 

@@ -322,7 +322,10 @@ def build_settings(role, *, name, machines, bind_host=None, server_host=None, po
         if not links_path:
             raise ValueError("links_path")
         lines += ["[server]", "externalConfig=true", f"externalConfigFile={_q(_fwd(links_path))}",
-                  f"enableClipboard={_b(clipboard)}"]
+                  f"enableClipboard={_b(clipboard)}",
+                  # Scroll Lock не запирает курсор (на ноутбуках его часто нет, а включённый — запирал при старте);
+                  # запирание — только нашими клавишами lockCursorToScreen
+                  "disableLockToComputer=true"]
     lines += ["[log]", f"level={log_level}"]
     for n in names:
         lines += [f"[computer_{n}]", f"name={n}"]
