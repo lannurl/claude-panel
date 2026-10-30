@@ -1,0 +1,13 @@
+deskflow-core.exe: 1.27.0
+Usage: C:\Program Files\Deskflow\deskflow-core.exe coremode [options]
+Keyboard and mouse sharing utility
+
+Options:
+  -h, --help                   Display Help on the command line
+  -v, --version                Display version information
+  --new-instance               Skip the check for a running instance, always
+                               makes a new instance
+  -s, --settings <configFile>  override configuration file to use
+
+Arguments:
+  coremode                     The mode to start in either: server or client

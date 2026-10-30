@@ -3111,6 +3111,7 @@ class Panel:
     def mon_init(self, autostart):
         """Создать MonitorsCtl, если бэкенд на месте. Нет модулей или конструктор упал — вкладка покажет причину."""
         self.mon_save_warn, self.mon_paste_armed, self.mon_answered = [], 0.0, set()  # answered — токены отката
+        self.mon_df_rejected = None  # отпечаток, которому сказали «не совпадает» (плашку больше не показываем)
         if not (layout and monitors_ctl and layout_editor):
             return
         data_dir = getattr(plat, "DATA_DIR", None)
@@ -3251,6 +3252,7 @@ class Panel:
         self.mon_modes(area)
         if not self.mon_this():
             self.mon_pick_machine(area)
+        self.mon_shared(area)
         head = self.mon_head(area, "РАСКЛАДКА — КАК НА СТОЛЕ", pady=(10, 4))
         ui["detect"] = self.mon_button(head, "Определить экраны", self.mon_detect)
         ui["detect"].pack(side="right")
@@ -3291,7 +3293,7 @@ class Panel:
         return {"small": self.f_small, "tiny": self.f_tiny, "bold": self.f_bold}
 
     def mon_modes(self, area):
-        """Полоса режимов. На этапе 1 работает только «Выкл» (свои экраны); остальное — заготовки со статусом."""
+        """Полоса режимов: «Выкл» и «Общая мышь» (этап 2) нажимаются; «Ноут как монитор» — этап 3."""
         ui = self.mon_ui
         self.mon_head(area, "РЕЖИМЫ")
         row = tk.Frame(area, bg=C["bg"])
@@ -3300,16 +3302,217 @@ class Panel:
         for key, title in (("off", "Выкл"), ("shared", "Общая мышь (Deskflow)"), ("monitor", "Ноут как монитор")):
             cell = tk.Frame(row, bg=C["item"], highlightthickness=1, highlightbackground=C["item"])
             cell.pack(side="left", fill="both", expand=True, padx=(0 if key == "off" else 4, 0))
-            soon = key != "off"
+            soon = key == "monitor"
             t = tk.Label(cell, text=title + (" · скоро" if soon else ""), bg=C["item"], fg=C["ink"], font=self.f_small,
                          anchor="w", padx=8, pady=2)
             t.pack(fill="x", pady=(3, 0))
             sub = tk.Label(cell, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w", justify="left",
                            padx=8, wraplength=int(170 * self.s))
             sub.pack(fill="x", pady=(0, 4))
+            if not soon:
+                cell.configure(cursor="hand2", takefocus=1, highlightcolor=C["ink"])
+                for w in (cell, t, sub):
+                    w.bind("<Button-1>", lambda e, k=key: self.mon_pick_mode(k))
+                for seq in ("<Return>", "<space>"):
+                    cell.bind(seq, lambda e, k=key: self.mon_pick_mode(k))
             ui["modes"][key] = (cell, t, sub)
-        ui["mode_line"] = tk.Label(area, text="", bg=C["bg"], fg=C["muted"], font=self.f_tiny, anchor="w")
+        ui["mode_line"] = tk.Label(area, text="", bg=C["bg"], fg=C["muted"], font=self.f_tiny, anchor="w",
+                                   justify="left", wraplength=int(540 * self.s))
         ui["mode_line"].pack(fill="x", pady=(2, 0))
+
+    def mon_pick_mode(self, key, server=None):
+        snap = self.mon_snap
+        if snap.get("busy"):
+            return self.flash("Подожди — предыдущая команда ещё выполняется", C["accent"])
+        if key == "shared":
+            comp = (snap.get("components") or {}).get("deskflow") or {}
+            if comp.get("state") not in ("ok", None):
+                cmd = comp.get("cmd")
+                return self.flash(f"Deskflow {self.mon_comp('deskflow')[0]}" + (f" — поставь: {cmd}" if cmd else ""),
+                                  C["accent"])
+            if self.mon_dirty:
+                return self.flash("Сначала «Сохранить» раскладку — Deskflow берёт сохранённую", C["accent"])
+            if not self.mon_this():
+                return self.flash("Сначала выбери, какой компьютер на схеме — этот", C["accent"])
+        elif snap.get("mode") == key:
+            return
+        res = self.mon_call("set_mode", key, server) if key == "shared" else self.mon_call("set_mode", key)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Режим не включён" if key == "shared" else "Режим не выключен")
+        self.mon_refresh_snap()
+        self.mon_paint_status()
+        self.flash("Включаю общую мышь…" if key == "shared" else "Общая мышь выключена")
+
+    def mon_shared(self, area):
+        """Блок «Общая мышь» (§8.2): статус Deskflow, главный компьютер, отпечаток и доверие (TLS)."""
+        ui = self.mon_ui
+        self.mon_head(area, "ОБЩАЯ МЫШЬ И КЛАВИАТУРА", pady=(10, 4))
+        box = tk.Frame(area, bg=C["item"])
+        box.pack(fill="x")
+        inner = tk.Frame(box, bg=C["item"])
+        inner.pack(fill="x", padx=10, pady=7)
+        row = tk.Frame(inner, bg=C["item"])
+        row.pack(fill="x")
+        ui["df_status"] = tk.Label(row, text="", bg=C["item"], fg=C["ink"], font=self.f_bold, anchor="w")
+        ui["df_status"].pack(side="left")
+        srv = tk.Frame(row, bg=C["item"])
+        srv.pack(side="right")
+        tk.Label(srv, text="Главный:", bg=C["item"], fg=C["muted"], font=self.f_tiny, padx=4).pack(side="left")
+        ui["df_srv"] = {}
+        for m in (self.mon_draft.machines if self.mon_draft else []):
+            b = self.mon_button(srv, m.name, lambda mid=m.id: self.mon_pick_server(mid))
+            b.pack(side="left", padx=(4, 0))
+            ui["df_srv"][m.id] = b
+        ui["df_detail"] = tk.Label(inner, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w",
+                                   justify="left", wraplength=int(540 * self.s))
+        ui["df_detail"].pack(fill="x", pady=(2, 0))
+        # плашка доверия: появляется, когда второй компьютер стучится с незнакомым отпечатком
+        ui["df_trust"] = tk.Frame(inner, bg=C["item"], highlightthickness=1, highlightbackground=C["accent"])
+        ti = tk.Frame(ui["df_trust"], bg=C["item"])
+        ti.pack(fill="x", padx=8, pady=6)
+        ui["df_trust_text"] = tk.Label(ti, text="", bg=C["item"], fg=C["ink"], font=self.f_small, anchor="w",
+                                       justify="left", wraplength=int(520 * self.s))
+        ui["df_trust_text"].pack(fill="x")
+        ui["df_trust_fp"] = tk.Label(ti, text="", bg=C["item"], fg=C["accent"], font=self.f_mono, anchor="w",
+                                     justify="left", wraplength=int(520 * self.s))
+        ui["df_trust_fp"].pack(fill="x", pady=(3, 0))
+        tr = tk.Frame(ti, bg=C["item"])
+        tr.pack(fill="x", pady=(5, 0))
+        self.mon_button(tr, "Совпадает — доверять", self.mon_trust_peer, primary=True).pack(side="left")
+        self.mon_button(tr, "Не совпадает", self.mon_distrust_peer).pack(side="left", padx=(6, 0))
+        # отпечаток этого компьютера — его сверяют на другом
+        fp_row = tk.Frame(inner, bg=C["item"])
+        fp_row.pack(fill="x", pady=(5, 0))
+        tk.Label(fp_row, text="Отпечаток этого компьютера:", bg=C["item"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+        ui["df_fp_copy"] = self.mon_button(fp_row, "Копировать", self.mon_copy_fp)
+        ui["df_fp_copy"].pack(side="right")
+        ui["df_fp"] = tk.Label(inner, text="", bg=C["item"], fg=C["ink"], font=self.f_mono, anchor="w", justify="left",
+                               wraplength=int(540 * self.s))
+        ui["df_fp"].pack(fill="x")
+        ui["df_install"] = tk.Frame(inner, bg=C["item"])
+        ui["df_install_text"] = tk.Label(ui["df_install"], text="", bg=C["item"], fg=C["accent"], font=self.f_tiny,
+                                         anchor="w", justify="left", wraplength=int(430 * self.s))
+        ui["df_install_text"].pack(side="left", fill="x", expand=True)
+        self.mon_button(ui["df_install"], "Копировать команду", self.mon_copy_install).pack(side="right")
+        self.mon_note(inner, "На втором компьютере тоже нужна панель с той же раскладкой («Копировать раскладку» → "
+                             "«Вставить раскладку») и режим «Общая мышь» с тем же главным. Ctrl+Alt+Shift+F11 — "
+                             "запереть курсор на текущем компьютере, F12 — отпустить. Input Director на время "
+                             "общей мыши закрой: две такие программы мешают друг другу.")
+
+    @staticmethod
+    def mon_fp_human(fp):
+        """«ab12…» (64 hex) → «AB:12:…»; уже человекочитаемый — как есть."""
+        s = re.sub(r"[^0-9A-Fa-f]", "", str(fp or ""))
+        if len(s) != 64:
+            return str(fp or "")
+        s = s.upper()
+        return ":".join(s[i:i + 2] for i in range(0, 64, 2))
+
+    def mon_peer_id(self):
+        """Второй компьютер схемы (UI рассчитан на две машины, §1)."""
+        me = self.mon_this()
+        lay = self.mon_draft
+        return next((m.id for m in lay.machines if m.id != me), None) if lay else None
+
+    def mon_paint_shared(self):
+        ui = self.mon_ui
+        lb = ui.get("df_status") if ui else None
+        if not lb or not lb.winfo_exists():
+            return
+        snap = self.mon_snap
+        df = snap.get("deskflow") or {}
+        comp = (snap.get("components") or {}).get("deskflow") or {}
+        mode, server = snap.get("mode") or "off", snap.get("server")
+        me, peer = self.mon_this(), self.mon_peer_id()
+        peer_name = self.mon_machine_name(peer) if peer else "второй компьютер"
+        connected = [str(c) for c in (df.get("connected") or [])]
+        role = df.get("role")
+        if comp.get("state") not in ("ok", None):
+            text, fg = f"Deskflow {self.mon_comp('deskflow')[0]}", C["accent"]
+        elif mode != "shared":
+            text, fg = "○ Выключено", C["ink"]
+        elif df.get("err"):
+            text, fg = "● Ошибка", C["red"]
+        elif not df.get("running"):
+            text, fg = "● Запускаю…", C["accent"]
+        elif role == "server":
+            text, fg = (f"● Главный · подключён {', '.join(connected)}", C["mint"]) if connected else \
+                       (f"● Главный · жду {peer_name}", C["accent"])
+        else:
+            text, fg = (f"● Подключён к {self.mon_machine_name(server)}", C["mint"]) if df.get("connected") else \
+                       (f"● Подключаюсь к {self.mon_machine_name(server)}…", C["accent"])
+        lb.configure(text=text, fg=fg)
+        for mid, b in ui.get("df_srv", {}).items():
+            on = mid == server
+            b.configure(fg=C["accent"] if on else C["ink"], text=("● " if on else "") + self.mon_machine_name(mid))
+        detail = []
+        if df.get("err"):
+            detail.append(clip(str(df["err"]), 160))
+        elif mode == "shared" and df.get("running") and df.get("since"):
+            detail.append(f"работает с {str(df['since'])[11:16]}")
+        if mode != "shared" and comp.get("state") == "ok":
+            detail.append("Нажми «Общая мышь» вверху — или выбери главный компьютер справа.")
+        if not me:
+            detail.append("Не выбрано, какой компьютер на схеме — этот.")
+        ui["df_detail"].configure(text=" · ".join(detail))
+        pend = df.get("pending_peer_fp")
+        fp = pend.get("fp") if isinstance(pend, dict) else (pend if isinstance(pend, str) else None)
+        if fp and fp != self.mon_df_rejected:
+            ui["df_trust_text"].configure(text=f"{peer_name} хочет подключиться, но его отпечаток ещё незнакомый. "
+                                               f"Открой панель на {peer_name} и сравни с её строкой «Отпечаток этого "
+                                               f"компьютера» — хотя бы первые и последние 4 пары:")
+            ui["df_trust_fp"].configure(text=self.mon_fp_human(fp))
+            if not ui["df_trust"].winfo_ismapped():
+                ui["df_trust"].pack(fill="x", pady=(6, 0), after=ui["df_detail"])
+        elif ui["df_trust"].winfo_ismapped():
+            ui["df_trust"].pack_forget()
+        ui["df_fp"].configure(text=self.mon_fp_human(df.get("fp_local")) if df.get("fp_local")
+                              else "появится после первого включения общей мыши")
+        if comp.get("state") in ("missing", "old") and comp.get("cmd"):
+            ui["df_install_text"].configure(text=f"Установка: {comp['cmd']}" +
+                                            (" (нужны права администратора)" if comp.get("admin_to_install") else ""))
+            if not ui["df_install"].winfo_ismapped():
+                ui["df_install"].pack(fill="x", pady=(6, 0))
+        elif ui["df_install"].winfo_ismapped():
+            ui["df_install"].pack_forget()
+
+    def mon_pick_server(self, mid):
+        if self.mon_snap.get("mode") == "shared" and self.mon_snap.get("server") == mid:
+            return
+        self.mon_pick_mode("shared", mid)
+
+    def mon_trust_peer(self):
+        df = self.mon_snap.get("deskflow") or {}
+        pend = df.get("pending_peer_fp")
+        fp = pend.get("fp") if isinstance(pend, dict) else pend
+        peer = self.mon_peer_id()
+        if not fp or not peer:
+            return
+        res = self.mon_call("trust_peer", peer, fp)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Не добавил в доверенные")
+        self.mon_refresh_snap()
+        self.mon_paint_shared()
+        self.flash(f"{self.mon_machine_name(peer)} в доверенных — подключение пойдёт само через пару секунд")
+
+    def mon_distrust_peer(self):
+        df = self.mon_snap.get("deskflow") or {}
+        pend = df.get("pending_peer_fp")
+        self.mon_df_rejected = pend.get("fp") if isinstance(pend, dict) else pend
+        self.mon_paint_shared()
+        self.flash("Не доверяю. Если это точно твой компьютер — переустанови сертификат на нём и сверь снова", C["red"])
+
+    def mon_copy_fp(self):
+        fp = (self.mon_snap.get("deskflow") or {}).get("fp_local")
+        if not fp:
+            return self.flash("Отпечатка ещё нет — включи общую мышь один раз", C["accent"])
+        self.copy(self.mon_fp_human(fp), "Отпечаток скопирован")
+
+    def mon_copy_install(self):
+        cmd = ((self.mon_snap.get("components") or {}).get("deskflow") or {}).get("cmd")
+        if cmd:
+            self.copy(cmd, "Команда скопирована — вставь в PowerShell" if sys.platform == "win32"
+                      else "Команда скопирована — вставь в Терминал")
 
     def mon_comp(self, name):
         """(текст, цвет) состояния компонента из snapshot()["components"] (§5.5.1)."""
@@ -3420,16 +3623,20 @@ class Panel:
         for key, (cell, t, sub) in ui["modes"].items():
             on = key == mode
             cell.configure(highlightbackground=C["accent"] if on else C["item"])
-            t.configure(fg=C["accent"] if on else (C["ink"] if key == "off" else C["muted"]))
+            t.configure(fg=C["accent"] if on else (C["muted"] if key == "monitor" else C["ink"]))
             sub.configure(text=subs[key][0], fg=subs[key][1])
         pend = snap.get("os_positions_pending")  # плашка отката переживает перестройку вкладки
         if isinstance(pend, dict) and pend.get("token") and not self.mon_pending:
             self.mon_start_pending(pend["token"], pend.get("deadline_s", MON_ROLLBACK_S))
         if snap.get("busy"):
             ui["mode_line"].configure(text=snap.get("busy_text") or "Выполняю…", fg=C["accent"])
+        elif mode == "shared":
+            ui["mode_line"].configure(text="Курсор уходит на другой компьютер через край по схеме ниже — по реальным "
+                                           "размерам экранов.", fg=C["muted"])
         else:
-            ui["mode_line"].configure(text="Переходы на другой компьютер — в следующих версиях. Сейчас: схема и помощник "
-                                           "курсора для своих экранов.", fg=C["muted"])
+            ui["mode_line"].configure(text="«Общая мышь» — одна мышь и клавиатура на два компьютера. «Ноут как монитор» "
+                                           "— в следующей версии.", fg=C["muted"])
+        self.mon_paint_shared()
         self.mon_paint_edge()
 
     def mon_paint_edge(self):
@@ -3453,7 +3660,7 @@ class Panel:
         elif edge.get("err"):
             text, fg = clip(f"ошибка: {edge['err']}", 70), C["red"]
         elif running and edge.get("client_state") == "client_absolute":  # §7.4.1: курсором ведёт главный (Deskflow)
-            text, fg = "пауза: курсором управляет главный компьютер — для переходов по размерам нажми там Ctrl+Alt+Shift+A", C["accent"]
+            text, fg = "пауза: курсором управляет главный компьютер — для переходов по размерам нажми там Ctrl+Alt+Shift+F9", C["accent"]
         elif running and edge.get("user_paused"):
             text, fg = "на паузе — нажми «Продолжить»", C["accent"]
         elif running and edge.get("paused"):

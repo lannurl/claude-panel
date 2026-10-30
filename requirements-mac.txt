@@ -6,3 +6,5 @@ pynput
 pyobjc-framework-Cocoa
 # Необязательно: перетаскивание файлов из панели в другие программы (tkdnd; на macOS не проверено)
 tkinterdnd2>=0.7.0
+# «Общая мышь»: сертификат TLS для Deskflow (без неё нужен openssl)
+cryptography>=42.0

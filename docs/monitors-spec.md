@@ -672,14 +672,14 @@ left(0,55)=laptop-a(51,73)  left(55,100)=laptop-a(72,73)
 section: options
 	clipboardSharing = true
 	relativeMouseMoves = true
-	keystroke(Control+Alt+Shift+A) = switchToScreen(laptop-a), lockCursorToScreen(on)
-	keystroke(Control+Alt+Shift+B) = lockCursorToScreen(off), switchToScreen(laptop-b)
+	keystroke(Control+Alt+Shift+F9) = switchToScreen(laptop-a), lockCursorToScreen(on)
+	keystroke(Control+Alt+Shift+F10) = lockCursorToScreen(off), switchToScreen(laptop-b)
 	keystroke(Control+Alt+Shift+F11) = lockCursorToScreen(on)
 	keystroke(Control+Alt+Shift+F12) = lockCursorToScreen(off)
 end
 ```
 
-Сочетания вынесены в аддитивный ключ `monitors.deskflow.work_on_hotkeys` (дополнение к §4, необязательный; по умолчанию — как выше). Ключ `{"work_on": "Control+Alt+Shift+A", "back": "Control+Alt+Shift+B", "lock": "Control+Alt+Shift+F11", "unlock": "Control+Alt+Shift+F12"}` проверяется регуляркой `^(Control|Alt|Shift|Super)(\+(Control|Alt|Shift|Super))*\+[A-Za-z0-9]{1,3}$`. F11/F12 нужны только автоматике этапа 4b. Ctrl+Alt+Shift+Q не занимаем: это выход из Moonlight.
+Сочетания вынесены в аддитивный ключ `monitors.deskflow.work_on_hotkeys` (дополнение к §4, необязательный; по умолчанию — как выше). Ключ `{"work_on": "Control+Alt+Shift+F9", "back": "Control+Alt+Shift+F10", "lock": "Control+Alt+Shift+F11", "unlock": "Control+Alt+Shift+F12"}` проверяется регуляркой `^(Control|Alt|Shift|Super)(\+(Control|Alt|Shift|Super))*\+[A-Za-z0-9]{1,3}$`. F11/F12 нужны только автоматике этапа 4b. Ctrl+Alt+Shift+Q не занимаем: это выход из Moonlight.
 
 **Этап 2b — вручную, без связки:**
 1. Пользователь за B нажимает Ctrl+Alt+Shift+A: курсор переходит на A (в точку, которую выбирает `switchToScreen`, обычно центр — **НП**) и фиксируется.

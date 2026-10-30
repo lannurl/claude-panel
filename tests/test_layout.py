@@ -148,10 +148,10 @@ class TestParseConfig(unittest.TestCase):
         raw["deskflow"] = {"work_on_hotkeys": {"work_on": "Control+Alt+Q"}}
         lay, warn = L.parse_config(raw)
         self.assertEqual(lay.extra["deskflow"]["work_on_hotkeys"]["work_on"], "Control+Alt+Q")
-        self.assertEqual(lay.extra["deskflow"]["work_on_hotkeys"]["back"], "Control+Alt+Shift+B")
+        self.assertEqual(lay.extra["deskflow"]["work_on_hotkeys"]["back"], "Control+Alt+Shift+F10")
         raw["deskflow"] = {"work_on_hotkeys": {"work_on": "Control+Q & calc"}}
         lay, warn = L.parse_config(raw)
-        self.assertEqual(lay.extra["deskflow"]["work_on_hotkeys"]["work_on"], "Control+Alt+Shift+A")
+        self.assertEqual(lay.extra["deskflow"]["work_on_hotkeys"]["work_on"], "Control+Alt+Shift+F9")
         self.assertTrue(warn)
 
     def test_none_and_garbage(self):

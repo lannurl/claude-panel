@@ -33,7 +33,7 @@ APP_NAME_RE = re.compile(r"[\w .:-]{1,64}")
 DEFAULT_EXTRA = {
     "deskflow": {"port": 24800, "server": None, "path": None, "tls": True, "clipboard": True,
                  "corner_band_pct": 1.0, "percent_decimals": None,
-                 "work_on_hotkeys": {"work_on": "Control+Alt+Shift+A", "back": "Control+Alt+Shift+B",
+                 "work_on_hotkeys": {"work_on": "Control+Alt+Shift+F9", "back": "Control+Alt+Shift+F10",
                                      "lock": "Control+Alt+Shift+F11", "unlock": "Control+Alt+Shift+F12"}},
     "stream": {"host_machine": None, "client_machine": None, "host_app": None, "app_name": "Desktop",
                "virtual_screen": None, "virtual_match": ["SudoVDA", "Virtual Display"], "moonlight_path": None},

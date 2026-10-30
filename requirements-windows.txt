@@ -8,3 +8,5 @@ winrt-Windows.Foundation.Collections>=4!10.0.28000.2705
 winrt-Windows.Storage.Streams>=4!10.0.28000.2705
 # Необязательно: перетаскивание файлов из панели в другие программы (tkdnd)
 tkinterdnd2>=0.7.0
+# «Общая мышь»: сертификат TLS для Deskflow (без неё нужен openssl)
+cryptography>=42.0

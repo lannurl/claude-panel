@@ -1,8 +1,9 @@
 """Оркестратор вкладки «Мониторы» (docs/monitors-spec.md, §5.5, §7.5, §8) — единственное, что вызывает UI.
 
 Этап 1: раскладка (сохранение/импорт/экспорт), экраны ОС, помощник краёв, «Применить к Windows» с откатом через
-15 с, предпросмотр (dry-run). Режимы: только "off". "shared" (Deskflow) — этап 2, "monitor" (Apollo/Moonlight) —
-этап 3: сейчас set_mode для них возвращает ошибку not_found с понятным текстом.
+15 с, предпросмотр (dry-run). Этап 2: режим "shared" (Deskflow через deskflow_ctl): сертификат, файлы настроек,
+запуск роли сервер/клиент, сверка отпечатков, восстановление при запуске. "monitor" (Apollo/Moonlight) — этап 3:
+set_mode для него возвращает ошибку not_found с понятным текстом.
 
 Публичные методы не бросают исключений и не блокируют поток Tk дольше 50 мс: долгое — в рабочем потоке,
 результаты — событиями on_event(kind, payload) из фоновых потоков.
@@ -19,6 +20,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import deskflow_ctl as D
 import layout as L
 
 ROLLBACK_S = 15
@@ -95,6 +97,12 @@ class MonitorsCtl:
         self._worker = None
         self._started = False
         self._this = self._detect_this_machine()
+        self._df = None            # deskflow_ctl.Deskflow — свой процесс (или перенятый)
+        self._df_path = None
+        self._find = None          # кэш find_deskflow (запуск --version — не в потоке Tk)
+        self._df_err = None        # последняя ошибка запуска/остановки Deskflow (для snapshot)
+        self._server = None        # id машины-сервера в режиме shared
+        self._fp_cache = (None, None)
 
     # ── служебное ──
     def _fn(self, name):
@@ -246,6 +254,7 @@ class MonitorsCtl:
                 edge.start()
                 with self._lock:
                     self._edge = edge
+                self._apply_edge_client_state()
                 log("помощник краёв включён")
             except Exception as e:
                 log(f"EdgeHelper: {type(e).__name__}")
@@ -282,7 +291,7 @@ class MonitorsCtl:
                 self._started = True
             self._refresh_displays()   # ~2 мс на Windows
             self._sync_edge()
-            # режимы shared/monitor — этапы 2–3; сохранённый режим не трогаем, чтобы этап 2 мог его подхватить
+            self._submit(self._restore)   # поиск Deskflow и восстановление режима — в рабочем потоке
             self._ensure_worker()
         except Exception as e:
             log(f"start: {type(e).__name__}: {e}")
@@ -296,6 +305,9 @@ class MonitorsCtl:
                 pend["timer"].cancel()   # закрытие панели во время ожидания — откатить сразу
                 self._do_rollback(pend["token"])
             self._sync_edge()
+            ex = self._layout.extra if self._layout else L.DEFAULT_EXTRA
+            if ex.get("stop_on_exit"):
+                self._stop_df()
             self._save_state()
             self._jobs.put(None)
         except Exception as e:
@@ -316,6 +328,42 @@ class MonitorsCtl:
             return {"this_machine": None, "mode": "off", "server": None, "busy": False, "busy_text": "",
                     "layout_ok": False, "warnings": ["Внутренняя ошибка — подробности в логе"], "components": {},
                     "deskflow": {}, "stream": {}, "edge": {}, "link": {}}
+
+    def _deskflow_component(self):
+        f = self._find
+        inst = D.INSTALL[D.OS_KEY]
+        if f is None:
+            return {"state": "na", "note": "проверяется…", "version": None, "path": None,
+                    "admin_to_install": inst["admin"], "url": inst["url"], "cmd": inst["cmd"], "err": None}
+        return {"state": f.get("state") or "missing", "version": f.get("version"), "path": f.get("path"),
+                "admin_to_install": inst["admin"], "url": inst["url"], "cmd": inst["cmd"],
+                "err": f.get("err"), "hint": f.get("hint"), "warning": f.get("warning")}
+
+    def _local_fp(self):
+        """Отпечаток нашего сертификата (человекочитаемый) или None, если сертификата ещё нет."""
+        path = self._data_dir / "deskflow" / "tls" / "deskflow.pem"
+        try:
+            mt = path.stat().st_mtime_ns
+        except OSError:
+            return None
+        if self._fp_cache[0] == mt:
+            return self._fp_cache[1]
+        r = D.local_fingerprint(path)
+        fp = r.get("fp_human") if r.get("ok") else None
+        self._fp_cache = (mt, fp)
+        return fp
+
+    def _deskflow_block(self):
+        with self._lock:
+            df, err, server = self._df, self._df_err, self._server
+        st = df.status() if df else {}
+        pending = st.get("pending_peer_fp")
+        connected = list(st.get("connected") or [])
+        trusted = False if pending else (True if connected else None)
+        return {"running": bool(st.get("running")), "role": st.get("role"), "connected": connected,
+                "since": st.get("since"), "fp_local": self._local_fp(), "pending_peer_fp": pending,
+                "peer_trusted": trusted, "err": err or st.get("err"), "log_tail": list(st.get("log_tail") or []),
+                "server": server, "last_switch": st.get("last_switch")}
 
     def _snapshot(self):
         with self._lock:
@@ -343,16 +391,16 @@ class MonitorsCtl:
                                          "last_warp": None, "raw_input": False, "client_state": "local"}
         na = {"state": "na", "note": "будет на следующем этапе", "err": None}
         return {
-            "this_machine": self._this, "mode": mode, "server": (ex.get("deskflow") or {}).get("server"),
+            "this_machine": self._this, "mode": mode,
+            "server": self._server if mode == "shared" and self._server else (ex.get("deskflow") or {}).get("server"),
             "busy": busy, "busy_text": busy_text,
             "layout_ok": lay is not None and bool(lay.screens), "warnings": uniq,
             "components": {
-                "deskflow": dict(na), "apollo": dict(na), "moonlight": dict(na),
+                "deskflow": self._deskflow_component(), "apollo": dict(na), "moonlight": dict(na),
                 "edge": {"state": "ok" if edge_cls else "unsupported", "raw_input": bool(st.get("raw_input")),
                          "ease_cursor": ease},
             },
-            "deskflow": {"running": False, "role": None, "connected": [], "since": None, "fp_local": None,
-                         "peer_trusted": None, "err": None},
+            "deskflow": self._deskflow_block(),
             "stream": {"running": False, "virtual_display": None, "err": None},
             "edge": {"enabled": bool((ex.get("edge_helper") or {}).get("enabled")),
                      "running": bool(st.get("running")), "paused": bool(st.get("paused")) or self._edge_paused,
@@ -407,20 +455,234 @@ class MonitorsCtl:
     def set_mode(self, mode, server=None):
         if mode not in MODES:
             return _err("bad_config", "Неизвестный режим")
-        if mode == "shared":
-            return _err("not_found", "Режим «Общая мышь» появится на этапе 2 (Deskflow)")
         if mode == "monitor":
             return _err("not_found", "Режим «B как монитор» появится на этапе 3 (Apollo + Moonlight)")
+        if mode == "shared":
+            lay = self._layout
+            if lay is None or len(lay.machines) < 2:
+                return _err("bad_layout", "Для общей мыши нужна раскладка минимум из двух машин")
+            if self._this is None:
+                return _err("bad_config", "Не определено, какой это компьютер — выберите в мастере")
+            if server is not None and (not isinstance(server, str) or lay.machine(server) is None):
+                return _err("bad_config", "Такой машины нет в раскладке")
+            sid = self._pick_server(server)
+            if not self._begin_busy("Запускаю Deskflow…"):
+                return _err("busy", "Предыдущее действие ещё выполняется")
+            self._submit(self._job_shared, sid)
+            return {"ok": True, "code": None, "err": None, "pending": True}
+        if not self._begin_busy("Останавливаю Deskflow…"):
+            return _err("busy", "Предыдущее действие ещё выполняется")
+        self._submit(self._job_off)
+        return {"ok": True, "code": None, "err": None, "pending": True}
 
-        def job():
+    # ── Deskflow (этап 2) ──
+    def _begin_busy(self, text):
+        with self._lock:
+            if self._busy or self._pending:
+                return False
+            self._busy, self._busy_text = True, text
+        self._emit("snapshot_changed", None)
+        return True
+
+    def _end_busy(self):
+        with self._lock:
+            self._busy, self._busy_text = False, ""
+
+    def _pick_server(self, server=None):
+        """Аргумент → deskflow.server из раскладки → сохранённый в state → первая машина."""
+        lay = self._layout
+        for c in (server, (lay.extra.get("deskflow") or {}).get("server"), self._state.get("server")):
+            if c and lay.machine(c):
+                return c
+        return lay.machines[0].id
+
+    def _df_cfg(self):
+        lay = self._layout
+        return dict((lay.extra.get("deskflow") if lay else None) or L.DEFAULT_EXTRA["deskflow"])
+
+    def _do_find(self, force=False):
+        with self._lock:
+            if self._find is not None and not force:
+                return self._find
+        f = D.find_deskflow(self._df_cfg().get("path"))
+        with self._lock:
+            self._find = f
+        return f
+
+    def _ensure_df(self, find):
+        """Объект Deskflow под найденный путь; при смене пути старый процесс останавливается."""
+        with self._lock:
+            df, path = self._df, self._df_path
+        if df is not None and path == find["path"]:
+            return df
+        if df is not None:
+            df.stop()
+        df = D.Deskflow(find["path"], find["dialect"], self._data_dir, on_event=self._df_event)
+        with self._lock:
+            self._df, self._df_path = df, find["path"]
+        return df
+
+    def _stop_df(self):
+        with self._lock:
+            df = self._df
+        if df is None:
+            return {"ok": True}
+        res = df.stop()
+        with self._lock:
+            self._state.pop("deskflow", None)
+        return res
+
+    def _df_event(self, kind, payload):
+        """События из потока-читателя лога Deskflow."""
+        if kind == "deskflow_exited":
             with self._lock:
-                self._mode = "off"
+                was = self._mode == "shared"
+                if was:
+                    self._mode = "off"
+                    self._state["mode"] = "off"
+                    self._state.pop("deskflow", None)
+                err = (self._df.status().get("err") if self._df else None) or "Deskflow завершился"
+            if was:
+                self._save_state()
+                self._apply_edge_client_state()
+                self._emit("warning", {"text": f"Deskflow остановился: {err}"})
+                self._emit("mode_changed", {"mode": "off"})
+            self._emit("snapshot_changed", None)
+            return
+        if kind in ("deskflow_connected", "deskflow_disconnected", "deskflow_untrusted_peer", "deskflow_switch"):
+            self._emit(kind, payload)
+        self._emit("snapshot_changed", None)
+
+    def _apply_edge_client_state(self):
+        """Помощник краёв на Deskflow-клиенте: client_relative (spec §7.4.1; запасная эвристика отката есть в
+        EdgeHelper), иначе local."""
+        with self._lock:
+            edge = self._edge
+            client = self._mode == "shared" and self._this is not None and self._server not in (None, self._this)
+        fn = getattr(edge, "set_client_state", None) if edge is not None else None
+        if callable(fn):
+            try:
+                fn("client_relative" if client else "local")
+            except Exception as e:
+                log(f"set_client_state: {type(e).__name__}")
+
+    def _start_shared(self, server_id):
+        """Остановить своё, затем запустить роль. Возвращает словарь результата (в рабочем потоке)."""
+        lay = self._layout
+        me, srv = lay.machine(self._this), lay.machine(server_id)
+        if me is None or srv is None:
+            return _err("bad_config", "Не определены машины")
+        find = self._do_find()
+        if not find.get("ok"):
+            return _err(find.get("code") or "not_found", find.get("err") or "Deskflow не найден", find.get("hint"))
+        df = self._ensure_df(find)
+        df.stop()
+        cfg = self._df_cfg()
+        tls, port, clip = bool(cfg.get("tls", True)), int(cfg.get("port", 24800)), bool(cfg.get("clipboard", True))
+        names = [m.name for m in lay.machines]
+        cert = None
+        if tls:
+            c = D.ensure_certificate(self._data_dir)
+            if not c.get("ok"):
+                return c
+            cert = c["path"]
+        if me.id == srv.id:
+            other = next((m for m in lay.machines if m.id != me.id), None)
+            bind, err = D.resolve_bind_host(me.host, other.host if other else None)
+            if err:
+                return _err("bad_config", err)
+            with self._lock:
+                rt = self._runtime
+            dec = cfg.get("percent_decimals")
+            if dec is None:
+                dec = (find.get("dialect") or {}).get("decimals") or 2
+            links, _w = L.deskflow_links(rt or lay, decimals=dec, band_pct=cfg.get("corner_band_pct", 1.0))
+            conf = D.build_server_config(rt or lay, links, {"server": srv.id})
+            return df.start_server(conf, me.name, bind, port, tls, machines=names, cert_path=cert, clipboard=clip)
+        if not srv.host:
+            return _err("bad_config", "Не указан адрес сервера в раскладке")
+        return df.start_client(me.name, srv.host, port, tls, machines=names, cert_path=cert, clipboard=clip,
+                               server_name=srv.name)
+
+    def _job_shared(self, server_id):
+        try:
+            try:
+                res = self._start_shared(server_id)
+            except (ValueError, OSError) as e:
+                log(f"start_shared: {type(e).__name__}: {e}")
+                res = _err("bad_config", "Не удалось подготовить запуск Deskflow")
+            with self._lock:
+                df = self._df
+            if res.get("ok"):
+                with self._lock:
+                    self._mode, self._server, self._df_err = "shared", server_id, None
+                    self._state.update({"mode": "shared", "server": server_id,
+                                        "deskflow": df.process_info() if df else None})
+                log(f"режим shared, сервер {server_id}")
+            else:
+                with self._lock:
+                    self._mode, self._df_err = "off", res.get("err")
+                    self._state.update({"mode": "off"})
+                    self._state.pop("deskflow", None)
+                log(f"shared не запущен: {res.get('code')}")
+                self._emit("warning", {"text": res.get("err") or "Deskflow не запустился"})
+            self._save_state()
+        finally:
+            self._end_busy()
+        self._apply_edge_client_state()
+        self._emit("mode_changed", {"mode": self._mode})
+        self._emit("snapshot_changed", None)
+
+    def _job_off(self):
+        try:
+            self._stop_df()
+            with self._lock:
+                self._mode, self._df_err = "off", None
                 self._state["mode"] = "off"
             self._save_state()
-            self._emit("mode_changed", {"mode": "off"})
+        finally:
+            self._end_busy()
+        self._apply_edge_client_state()
+        self._emit("mode_changed", {"mode": "off"})
+        self._emit("snapshot_changed", None)
+
+    def _restore(self):
+        """При запуске панели: найти Deskflow, перенять живой процесс из state.json или запустить режим заново."""
+        find = self._do_find()
+        self._emit("snapshot_changed", None)
+        lay = self._layout
+        st = self._state
+        if lay is None or self._this is None or st.get("mode") != "shared" or not find.get("ok"):
+            return
+        server = st.get("server") if lay.machine(st.get("server")) else None
+        if server is None:
+            return
+        startup = lay.extra.get("startup_mode", "last")
+        info = st.get("deskflow")
+        df = self._ensure_df(find)
+        if info and df.adopt(info):
+            if startup == "off":
+                self._stop_df()
+                self._job_off_state()
+                return
+            with self._lock:
+                self._mode, self._server = "shared", server
+            self._apply_edge_client_state()
+            self._emit("mode_changed", {"mode": "shared"})
             self._emit("snapshot_changed", None)
-        self._submit(job)
-        return {"ok": True, "code": None, "err": None, "pending": True}
+            return
+        if startup == "last" and self._begin_busy("Восстанавливаю Deskflow…"):
+            self._job_shared(server)
+        else:
+            self._job_off_state()
+
+    def _job_off_state(self):
+        with self._lock:
+            self._mode = "off"
+            self._state["mode"] = "off"
+            self._state.pop("deskflow", None)
+        self._save_state()
+        self._emit("snapshot_changed", None)
 
     def set_edge_helper(self, enabled):
         if not isinstance(enabled, bool):
@@ -476,25 +738,62 @@ class MonitorsCtl:
                 return _err("bad_layout", "Раскладки нет")
             df = lay.extra.get("deskflow") or {}
             dec = df.get("percent_decimals")
-            links, w = L.deskflow_links(rt or lay, decimals=2 if dec is None else dec,
+            if dec is None:
+                dec = ((self._find or {}).get("dialect") or {}).get("decimals") or 2
+            links, w = L.deskflow_links(rt or lay, decimals=dec,
                                         band_pct=df.get("corner_band_pct", 1.0))
             warn += w
-            conf, argv = None, None
-            dctl = _optional("deskflow_ctl")
-            if dctl and hasattr(dctl, "build_server_config"):
-                try:
-                    conf = dctl.build_server_config(rt or lay, links, {"clipboard": df.get("clipboard", True)})
-                except Exception as e:
-                    log(f"build_server_config: {type(e).__name__}")
-            else:
-                warn.append("Конфиг Deskflow появится на этапе 2")
+            conf, argv, settings = None, None, None
+            sid = self._pick_server()
+            try:
+                conf = D.build_server_config(rt or lay, links, {"server": sid, "clipboard": df.get("clipboard", True)})
+            except (ValueError, KeyError) as e:
+                log(f"build_server_config: {type(e).__name__}")
+                warn.append("Конфиг Deskflow не построен — проверьте имена машин")
+            argv, settings = self._preview_launch(lay, me, sid, df, warn)
             positions = L.suggest_os_positions(rt, me) if rt is not None and me else {}
             return {"ok": True, "code": None, "err": None, "deskflow_conf": conf, "argv": argv,
+                    "deskflow_settings": settings,
                     "links": [lk.__dict__ for lk in links], "rules": [r.__dict__ for r in rules],
                     "os_positions": positions, "warnings": warn}
         except Exception as e:
             log(f"preview: {type(e).__name__}: {e}")
             return _err("os_error", "Предпросмотр не построен")
+
+    def _preview_launch(self, lay, me_id, server_id, df, warn):
+        """argv и текст настроек для предпросмотра. Без сети и запуска процессов (вызов из потока Tk)."""
+        me = lay.machine(me_id) if me_id else None
+        if me is None or lay.machine(server_id) is None:
+            warn.append("Команда запуска Deskflow не показана: не определено, какой это компьютер")
+            return None, None
+        find = self._find
+        if not find or not find.get("ok"):
+            warn.append("Команда запуска Deskflow не показана: Deskflow не найден или ещё проверяется")
+            return None, None
+        srv = lay.machine(server_id)
+        d = self._data_dir / "deskflow"
+        names = [m.name for m in lay.machines]
+        tls, port = bool(df.get("tls", True)), int(df.get("port", 24800))
+        cert = d / "tls" / "deskflow.pem"
+        try:
+            if me.id == srv.id:
+                bind = (me.host or "").strip() or "<LAN-адрес этой машины>"
+                if bind in ("0.0.0.0", "::"):
+                    warn.append("Адрес сервера 0.0.0.0 недопустим")
+                    return None, None
+                text = D.build_settings("server", name=me.name, machines=names, bind_host=bind, port=port, tls=tls,
+                                        cert_path=cert, links_path=d / "server.conf",
+                                        clipboard=bool(df.get("clipboard", True)))
+                role = "server"
+            else:
+                text = D.build_settings("client", name=me.name, machines=names, server_host=srv.host or "<адрес сервера>",
+                                        port=port, tls=tls, cert_path=cert, clipboard=bool(df.get("clipboard", True)))
+                role = "client"
+            argv = D.build_argv(role, find["path"], find["dialect"], settings_file=d / "settings.conf")
+            return argv, text
+        except ValueError as e:
+            warn.append(f"Настройки Deskflow не построены: {e}")
+            return None, None
 
     # ── «Применить к Windows» с откатом ──
     def _positions_by_os_id(self):
@@ -599,12 +898,43 @@ class MonitorsCtl:
     # ── прочее ──
     def refresh_components(self):
         def job():
+            self._do_find(force=True)
             self._refresh_displays()
             self._emit("snapshot_changed", None)
         self._submit(job)
 
     def trust_peer(self, machine_id, fp):
-        return _err("not_found", "Сверка отпечатков Deskflow появится на этапе 2")
+        """Доверять отпечатку собеседника: сервер пишет в trusted-clients, клиент — в trusted-servers."""
+        try:
+            lay = self._layout
+            if lay is None or not isinstance(machine_id, str) or lay.machine(machine_id) is None:
+                return _err("bad_config", "Такой машины нет в раскладке")
+            if self._this is None:
+                return _err("bad_config", "Не определено, какой это компьютер — выберите в мастере")
+            if machine_id == self._this:
+                return _err("bad_config", "Нужен отпечаток другой машины, а не этой")
+            h = D.normalize_fp(fp)
+            if not h:
+                return _err("bad_config", "Отпечаток должен быть 64 шестнадцатеричных символа (SHA-256)")
+            with self._lock:
+                df = self._df
+            st = df.status() if df else {}
+            if st.get("running") and st.get("role"):
+                role = st["role"]
+            else:
+                role = "server" if self._pick_server() == self._this else "client"
+            res = D.add_trusted(role, h)
+            if not res.get("ok"):
+                return res
+            if df is not None:
+                df.clear_pending(h)
+            log(f"доверенный отпечаток {machine_id} принят ({role})")
+            self._emit("snapshot_changed", None)
+            return {"ok": True, "code": None, "err": None, "role": role, "added": res.get("added"),
+                    "path": res.get("path")}
+        except Exception as e:
+            log(f"trust_peer: {type(e).__name__}: {e}")
+            return _err("os_error", "Не удалось сохранить отпечаток")
 
     def export_layout(self):
         lay = self._layout
@@ -644,13 +974,11 @@ class MonitorsCtl:
         server = lay.machine(df.get("server")) or lay.machines[0]
         me = lay.machine(self._this) if self._this else None
         conf = None
-        dctl = _optional("deskflow_ctl")
-        if dctl and hasattr(dctl, "build_server_config"):
-            links, _ = L.deskflow_links(lay)
-            try:
-                conf = dctl.build_server_config(lay, links, {"clipboard": df.get("clipboard", True)})
-            except Exception as e:
-                log(f"build_server_config: {type(e).__name__}")
+        links, _ = L.deskflow_links(lay)
+        try:
+            conf = D.build_server_config(lay, links, {"server": server.id, "clipboard": df.get("clipboard", True)})
+        except (ValueError, KeyError) as e:
+            log(f"build_server_config: {type(e).__name__}")
         return {"ok": True, "code": None, "err": None, "server_conf": conf, "server_host": server.host,
                 "port": df.get("port", 24800), "screen_name": me.name if me else None}
 
