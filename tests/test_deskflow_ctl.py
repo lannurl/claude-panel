@@ -431,7 +431,8 @@ class TestRealCore(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertTrue(any("started server" in x for x in r["log"]))
         self.assertTrue(any("active sides" in x for x in r["log"]))
-        self.assertEqual(r["warnings"], [])
+        # хоткеи может держать уже запущенный Deskflow панели — это не ошибка конфига
+        self.assertEqual([w for w in r["warnings"] if "register hotkey" not in w], [])
 
     def test_validate_config_bad_syntax(self):
         bad = self.conf.replace("right(0,50.57)", "sideways(0,50.57)")

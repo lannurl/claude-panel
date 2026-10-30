@@ -136,6 +136,17 @@ class MonitorsCtl:
         except OSError as e:
             log(f"state.json не записан: {type(e).__name__}")
 
+    def _remember_host(self, machine_id, host):
+        """Записать в раскладку найденный LAN-адрес машины (host был пустым). Сбой — только в лог."""
+        try:
+            lay = self._layout
+            ms = [replace(m, host=host) if m.id == machine_id else m for m in lay.machines]
+            res = self.save_layout(replace(lay, machines=ms))
+            log(f"адрес {machine_id} записан в раскладку: {host}" if res.get("ok")
+                else f"адрес {machine_id} не записан: {res.get('code')}")
+        except Exception as e:
+            log(f"_remember_host: {type(e).__name__}")
+
     def _detect_this_machine(self):
         lay = self._layout
         if lay is None:
@@ -592,6 +603,8 @@ class MonitorsCtl:
             bind, err = D.resolve_bind_host(me.host, other.host if other else None)
             if err:
                 return _err("bad_config", err)
+            if not (me.host or "").strip():
+                self._remember_host(me.id, bind)   # чтобы раскладка для второго компьютера несла адрес сервера
             with self._lock:
                 rt = self._runtime
             dec = cfg.get("percent_decimals")

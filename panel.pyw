@@ -3363,6 +3363,14 @@ class Panel:
             b = self.mon_button(srv, m.name, lambda mid=m.id: self.mon_pick_server(mid))
             b.pack(side="left", padx=(4, 0))
             ui["df_srv"][m.id] = b
+        me_row = tk.Frame(inner, bg=C["item"])
+        me_row.pack(fill="x", pady=(4, 0))
+        tk.Label(me_row, text="Этот компьютер на схеме:", bg=C["item"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+        ui["df_me"] = {}
+        for m in (self.mon_draft.machines if self.mon_draft else []):
+            b = self.mon_button(me_row, m.name, lambda mid=m.id: self.mon_switch_this(mid))
+            b.pack(side="left", padx=(6, 0))
+            ui["df_me"][m.id] = b
         ui["df_detail"] = tk.Label(inner, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w",
                                    justify="left", wraplength=int(540 * self.s))
         ui["df_detail"].pack(fill="x", pady=(2, 0))
@@ -3448,6 +3456,9 @@ class Panel:
         for mid, b in ui.get("df_srv", {}).items():
             on = mid == server
             b.configure(fg=C["accent"] if on else C["ink"], text=("● " if on else "") + self.mon_machine_name(mid))
+        for mid, b in ui.get("df_me", {}).items():
+            on = mid == me
+            b.configure(fg=C["mint"] if on else C["ink"], text=("● " if on else "") + self.mon_machine_name(mid))
         detail = []
         if df.get("err"):
             detail.append(clip(str(df["err"]), 160))
@@ -3482,6 +3493,20 @@ class Panel:
                 ui["df_install"].pack(fill="x", pady=(6, 0))
         elif ui["df_install"].winfo_ismapped():
             ui["df_install"].pack_forget()
+
+    def mon_switch_this(self, mid):
+        if mid == self.mon_this():
+            return
+        snap = self.mon_snap
+        was_shared, server = snap.get("mode") == "shared", snap.get("server")
+        res = self.mon_call("set_this_machine", mid)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Не запомнил")
+        self.mon_refresh_snap()
+        self.set_tab("monitors")
+        self.flash(f"Этот компьютер — {self.mon_machine_name(mid)}")
+        if was_shared:  # роль (главный/второй) зависит от того, кто «я», — перезапустить общую мышь
+            self.mon_pick_mode("shared", server)
 
     def mon_pick_server(self, mid):
         if self.mon_snap.get("mode") == "shared" and self.mon_snap.get("server") == mid:
