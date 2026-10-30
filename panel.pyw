@@ -3253,6 +3253,7 @@ class Panel:
         if not self.mon_this():
             self.mon_pick_machine(area)
         self.mon_shared(area)
+        self.mon_stream(area)
         head = self.mon_head(area, "РАСКЛАДКА — КАК НА СТОЛЕ", pady=(10, 4))
         ui["detect"] = self.mon_button(head, "Определить экраны", self.mon_detect)
         ui["detect"].pack(side="right")
@@ -3293,7 +3294,7 @@ class Panel:
         return {"small": self.f_small, "tiny": self.f_tiny, "bold": self.f_bold}
 
     def mon_modes(self, area):
-        """Полоса режимов: «Выкл» и «Общая мышь» (этап 2) нажимаются; «Ноут как монитор» — этап 3."""
+        """Полоса режимов: «Выкл», «Общая мышь» (этап 2) и «Ноут как монитор» (этапы 3–4)."""
         ui = self.mon_ui
         self.mon_head(area, "РЕЖИМЫ")
         row = tk.Frame(area, bg=C["bg"])
@@ -3302,7 +3303,7 @@ class Panel:
         for key, title in (("off", "Выкл"), ("shared", "Общая мышь (Deskflow)"), ("monitor", "Ноут как монитор")):
             cell = tk.Frame(row, bg=C["item"], highlightthickness=1, highlightbackground=C["item"])
             cell.pack(side="left", fill="both", expand=True, padx=(0 if key == "off" else 4, 0))
-            soon = key == "monitor"
+            soon = False
             t = tk.Label(cell, text=title + (" · скоро" if soon else ""), bg=C["item"], fg=C["ink"], font=self.f_small,
                          anchor="w", padx=8, pady=2)
             t.pack(fill="x", pady=(3, 0))
@@ -3334,14 +3335,25 @@ class Panel:
                 return self.flash("Сначала «Сохранить» раскладку — Deskflow берёт сохранённую", C["accent"])
             if not self.mon_this():
                 return self.flash("Сначала выбери, какой компьютер на схеме — этот", C["accent"])
+        elif key == "monitor":
+            if snap.get("mode") == "monitor":
+                return
+            if self.mon_dirty:
+                return self.flash("Сначала «Сохранить» раскладку — по ней ставится второй экран", C["accent"])
+            if not self.mon_this():
+                return self.flash("Сначала выбери, какой компьютер на схеме — этот", C["accent"])
+            comps = snap.get("components") or {}
+            if all((comps.get(k) or {}).get("state") not in ("ok", None) for k in ("apollo", "moonlight")):
+                return self.flash("Нет ни Apollo (на главном ноуте), ни Moonlight (на ноуте-мониторе) — "
+                                  "см. блок «Ноут как монитор»", C["accent"])
         elif snap.get("mode") == key:
             return
         res = self.mon_call("set_mode", key, server) if key == "shared" else self.mon_call("set_mode", key)
         if not self.mon_ok(res):
-            return self.mon_fail(res, "Режим не включён" if key == "shared" else "Режим не выключен")
+            return self.mon_fail(res, "Режим не включён" if key != "off" else "Режим не выключен")
         self.mon_refresh_snap()
         self.mon_paint_status()
-        self.flash("Включаю общую мышь…" if key == "shared" else "Общая мышь выключена")
+        self.flash({"shared": "Включаю общую мышь…", "monitor": "Включаю «Ноут как монитор»…"}.get(key, "Выключено"))
 
     def mon_shared(self, area):
         """Блок «Общая мышь» (§8.2): статус Deskflow, главный компьютер, отпечаток и доверие (TLS)."""
@@ -3406,6 +3418,144 @@ class Panel:
                              "«Вставить раскладку») и режим «Общая мышь» с тем же главным. Ctrl+Alt+Shift+F11 — "
                              "запереть курсор на текущем компьютере, F12 — отпустить. Input Director на время "
                              "общей мыши закрой: две такие программы мешают друг другу.")
+
+    def mon_stream(self, area):
+        """Блок «Ноут как монитор» (§8.3) и связка панелей (§8.5): статус, Apollo/Moonlight, код связки."""
+        ui = self.mon_ui
+        self.mon_head(area, "НОУТ КАК МОНИТОР", pady=(10, 4))
+        box = tk.Frame(area, bg=C["item"])
+        box.pack(fill="x")
+        inner = tk.Frame(box, bg=C["item"])
+        inner.pack(fill="x", padx=10, pady=7)
+        row = tk.Frame(inner, bg=C["item"])
+        row.pack(fill="x")
+        ui["st_status"] = tk.Label(row, text="", bg=C["item"], fg=C["ink"], font=self.f_bold, anchor="w")
+        ui["st_status"].pack(side="left")
+        ui["st_web"] = self.mon_button(row, "Открыть Apollo", self.mon_open_apollo)
+        ui["st_detail"] = tk.Label(inner, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w",
+                                   justify="left", wraplength=int(540 * self.s))
+        ui["st_detail"].pack(fill="x", pady=(2, 0))
+        # связка панелей: без неё кнопка на одном ноуте не может включить Moonlight на другом
+        lk = tk.Frame(inner, bg=C["item"])
+        lk.pack(fill="x", pady=(6, 0))
+        ui["lk_row"] = lk
+        ui["lk_status"] = tk.Label(lk, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w")
+        ui["lk_status"].pack(side="left")
+        self.mon_button(lk, "Вставить код", self.mon_link_paste).pack(side="right")
+        self.mon_button(lk, "Создать код", self.mon_link_new).pack(side="right", padx=(0, 6))
+        ui["lk_code"] = tk.Label(inner, text="", bg=C["item"], fg=C["accent"], font=self.f_mono, anchor="w")
+        ui["st_install"] = tk.Label(inner, text="", bg=C["item"], fg=C["accent"], font=self.f_tiny, anchor="w",
+                                    justify="left", wraplength=int(540 * self.s))
+        self.mon_note(inner, "Ноут B становится вторым монитором этого компьютера: Apollo здесь создаёт виртуальный "
+                             "экран и ставит его по схеме, Moonlight на ноуте B показывает его на весь экран. "
+                             "Связка панелей нужна один раз: «Создать код» здесь → «Вставить код» на другом ноуте. "
+                             "Выйти из картинки на ноуте B — Ctrl+Alt+Shift+Q.")
+
+    def mon_paint_stream(self):
+        ui = self.mon_ui
+        lb = ui.get("st_status") if ui else None
+        if not lb or not lb.winfo_exists():
+            return
+        snap = self.mon_snap
+        st = snap.get("stream") or {}
+        lk = snap.get("link") or {}
+        comps = snap.get("components") or {}
+        apollo, moon = comps.get("apollo") or {}, comps.get("moonlight") or {}
+        mode = snap.get("mode") or "off"
+        peer = self.mon_peer_id()
+        peer_name = self.mon_machine_name(peer) if peer else "второй ноут"
+        role = st.get("role")
+        if mode != "monitor":
+            text, fg = "○ Выключено", C["ink"]
+        elif st.get("err"):
+            text, fg = "● Ошибка", C["red"]
+        elif role == "host" and st.get("virtual_display"):
+            text, fg = ("● Второй экран на месте", C["mint"]) if st.get("positioned") else \
+                       ("● Второй экран есть, ставлю по схеме…", C["accent"])
+        elif role == "host":
+            text, fg = f"● Жду картинку на {peer_name}…", C["accent"]
+        elif role == "client" and st.get("running"):
+            text, fg = "● Показываю экран главного ноута", C["mint"]
+        else:
+            text, fg = "● Запускаю…", C["accent"]
+        lb.configure(text=text, fg=fg)
+        if apollo.get("state") == "ok":
+            if not ui["st_web"].winfo_ismapped():
+                ui["st_web"].pack(side="right")
+        elif ui["st_web"].winfo_ismapped():
+            ui["st_web"].pack_forget()
+        detail = []
+        if st.get("err"):
+            detail.append(clip(str(st["err"]), 160))
+        if st.get("hint"):
+            detail.append(clip(str(st["hint"]), 200))
+        if mode == "monitor" and role == "host" and st.get("virtual_display"):
+            detail.append(f"экран: {clip(str(st['virtual_display']), 40)}")
+        parts = []
+        for name, comp in (("Apollo", apollo), ("Moonlight", moon)):
+            s = comp.get("state")
+            if s == "ok":
+                parts.append(f"{name}: есть" + (" · работает" if comp.get("running") else ""))
+            elif s == "missing":
+                parts.append(f"{name}: не установлен")
+        if parts:
+            detail.append(" · ".join(parts))
+        ui["st_detail"].configure(text=" · ".join(detail))
+        need = [c.get("cmd") for c in (apollo, moon) if c.get("state") == "missing" and c.get("cmd")]
+        if need and all(c.get("state") != "ok" for c in (apollo, moon)):
+            ui["st_install"].configure(text="Поставь: " + " или ".join(need))
+            if not ui["st_install"].winfo_ismapped():
+                ui["st_install"].pack(fill="x", pady=(4, 0), after=ui["st_detail"])
+        elif ui["st_install"].winfo_ismapped():
+            ui["st_install"].pack_forget()
+        if lk.get("paired"):
+            on = lk.get("peer_online")
+            ltext = f"Связка с {peer_name}: " + ("на связи" if on else ("не отвечает" if on is False else "проверяю…"))
+            lfg = C["mint"] if on else (C["accent"] if on is False else C["muted"])
+        else:
+            ltext, lfg = f"Связка с {peer_name}: не настроена", C["muted"]
+        if lk.get("err"):
+            ltext += f" · {clip(str(lk['err']), 60)}"
+        ui["lk_status"].configure(text=ltext, fg=lfg)
+
+    def mon_open_apollo(self):
+        import webbrowser
+        url = ((self.mon_snap.get("components") or {}).get("apollo") or {}).get("web_ui") or ""
+        if not (url.startswith("https://localhost") or url.startswith("https://127.0.0.1")):
+            url = "https://localhost:47990"
+        webbrowser.open(url)
+
+    def mon_link_new(self):
+        if (self.mon_snap.get("link") or {}).get("paired") and time.monotonic() - getattr(self, "mon_link_armed", 0) > 5:
+            self.mon_link_armed = time.monotonic()
+            return self.flash("Связка уже есть — нажми «Создать код» ещё раз, чтобы заменить её новой", C["accent"])
+        res = self.mon_call("link_new_secret")
+        if not self.mon_ok(res) or not res.get("code"):
+            return self.mon_fail(res, "Код не создан")
+        code = str(res["code"])
+        ui = self.mon_ui
+        ui["lk_code"].configure(text=f"Код связки: {code}")
+        if not ui["lk_code"].winfo_ismapped():
+            ui["lk_code"].pack(fill="x", pady=(3, 0), after=ui["lk_row"])
+        self.copy(code, "Код скопирован — на другом ноуте нажми «Вставить код»")
+        self.mon_refresh_snap()
+        self.mon_paint_stream()
+
+    def mon_link_paste(self):
+        try:
+            text = self.root.clipboard_get().strip()
+        except tk.TclError:
+            text = ""
+        if not text:
+            return self.flash("В буфере пусто — сначала «Создать код» на другом ноуте", C["accent"])
+        if len(text) > 80:
+            return self.flash("В буфере не код связки", C["accent"])
+        res = self.mon_call("link_set_secret", text)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Код не принят")
+        self.mon_refresh_snap()
+        self.mon_paint_stream()
+        self.flash("Связка настроена")
 
     @staticmethod
     def mon_fp_human(fp):
@@ -3665,10 +3815,14 @@ class Panel:
         elif mode == "shared":
             ui["mode_line"].configure(text="Курсор уходит на другой компьютер через край по схеме ниже — по реальным "
                                            "размерам экранов.", fg=C["muted"])
+        elif mode == "monitor":
+            ui["mode_line"].configure(text="Ноут B — второй монитор этого компьютера; стоит там, где он на схеме.",
+                                      fg=C["muted"])
         else:
             ui["mode_line"].configure(text="«Общая мышь» — одна мышь и клавиатура на два компьютера. «Ноут как монитор» "
-                                           "— в следующей версии.", fg=C["muted"])
+                                           "— ноут B становится вторым экраном.", fg=C["muted"])
         self.mon_paint_shared()
+        self.mon_paint_stream()
         self.mon_paint_edge()
 
     def mon_paint_edge(self):

@@ -29,7 +29,7 @@ except OSError:
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
-DEFAULT_VIRTUAL_MATCH = ("SudoVDA", "Virtual Display")
+DEFAULT_VIRTUAL_MATCH = ("SudoVDA", "Virtual Display", "SudoMaker")
 MAX_WARPS_PER_S = 10        # аварийная остановка: больше переносов за 1 с — помощник встаёт на паузу
 PUSH_WINDOW_S = layout.CORNER_PUSH_WINDOW_S
 IDLE_WAIT_MS = 50           # пауза / нет правил — просыпаемся редко

@@ -35,8 +35,8 @@ DEFAULT_EXTRA = {
                  "corner_band_pct": 1.0, "percent_decimals": None,
                  "work_on_hotkeys": {"work_on": "Control+Alt+Shift+F9", "back": "Control+Alt+Shift+F10",
                                      "lock": "Control+Alt+Shift+F11", "unlock": "Control+Alt+Shift+F12"}},
-    "stream": {"host_machine": None, "client_machine": None, "host_app": None, "app_name": "Desktop",
-               "virtual_screen": None, "virtual_match": ["SudoVDA", "Virtual Display"], "moonlight_path": None},
+    "stream": {"host_machine": None, "client_machine": None, "host_app": None, "app_name": "Monitor",
+               "virtual_screen": None, "virtual_match": ["SudoVDA", "Virtual Display", "SudoMaker"], "moonlight_path": None},
     # помощник краёв по умолчанию ВЫКЛЮЧЕН: включается только пользователем из UI
     "edge_helper": {"enabled": False, "poll_ms": 4, "push_mickeys": 4, "inset_px": 2,
                     "max_step_px": 600, "skip_while_button_down": False},
