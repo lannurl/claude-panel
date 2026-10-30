@@ -905,6 +905,7 @@ class Deskflow:
         self._last_switch = None
         self._pending = None
         self._cand_fp = None
+        self._wait_trust = False   # клиент доверяет серверу, но сервер его ещё не подтвердил
         self._listening = False
         self._exit_reported = True
         self._alive_cache = (0.0, False)
@@ -940,7 +941,9 @@ class Deskflow:
                     ev.append(("deskflow_untrusted_peer", {"fp": p["fp"], "fp_human": format_fp(p["fp"]),
                                                            "role": role, "at": p["at"]}))
             if TRUSTED_OK_RE.search(msg):
-                self._pending = None
+                self._pending, self._err = None, None   # сверка прошла — прошлая ошибка устарела
+                if role == "client":
+                    self._wait_trust = True
             if lvl in ("ERROR", "FATAL"):
                 self._err = _scrub(msg)
             if SERVER_READY_RE.search(msg):
@@ -959,7 +962,7 @@ class Deskflow:
                     ev.append(("deskflow_disconnected", {"name": n}))
             if role == "client":
                 if SERVER_CONNECTED_RE.search(msg):
-                    self._pending, self._err = None, None
+                    self._pending, self._err, self._wait_trust = None, None, False
                     n = self._peer or "server"
                     if n not in self._connected:
                         self._connected.append(n)
@@ -1173,6 +1176,7 @@ class Deskflow:
                     "since": self._since if alive else None, "connected": list(self._connected) if alive else [],
                     "last_switch": dict(self._last_switch) if self._last_switch else None, "err": self._err,
                     "log_tail": list(self._tail), "pending_peer_fp": dict(self._pending) if self._pending else None,
+                    "waiting_peer_trust": self._wait_trust and not self._connected,
                     "listening": self._listening}
 
     def clear_pending(self, fp=None):

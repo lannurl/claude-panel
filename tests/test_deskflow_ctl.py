@@ -200,6 +200,22 @@ class TestLogParsing(unittest.TestCase):
         self.assertIsNone(self.df.status()["pending_peer_fp"])
         self.assertEqual(self.df._err, "failed to verify server certificate fingerprint")
 
+    def test_client_trusts_server_waits_for_server(self):
+        # реальный лог ноута A: сначала отказ, потом отпечаток добавлен — сервер ещё рвёт соединение
+        self.df._role = "client"
+        self.feed(f"DEBUG: peer fingerprint: {FP_A.upper()}", "WARNING: fingerprint does not match trusted fingerprint",
+                  "ERROR: failed to verify server certificate fingerprint")
+        self.assertTrue(self.df._err)
+        self.feed(f"DEBUG: peer fingerprint: {FP_A.upper()}", "DEBUG: fingerprint matches trusted fingerprint",
+                  "INFO: connected to secure socket", "DEBUG: tls connection closed",
+                  "DEBUG: disconnected from server", "DEBUG: retry in 1 seconds")
+        st = self.df.status()
+        self.assertIsNone(st["err"])
+        self.assertIsNone(st["pending_peer_fp"])
+        self.assertTrue(st["waiting_peer_trust"])
+        self.feed("DEBUG: connected to server")
+        self.assertFalse(self.df.status()["waiting_peer_trust"])
+
     def test_server_clients_and_error_clear(self):
         self.df._role = "server"
         self.feed("ERROR: secure socket error: tls certificate doesn't exist: C:/x")

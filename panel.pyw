@@ -3438,9 +3438,12 @@ class Panel:
         elif role == "server":
             text, fg = (f"● Главный · подключён {', '.join(connected)}", C["mint"]) if connected else \
                        (f"● Главный · жду {peer_name}", C["accent"])
+        elif df.get("connected"):
+            text, fg = f"● Подключён к {self.mon_machine_name(server)}", C["mint"]
+        elif df.get("waiting_peer_trust"):
+            text, fg = f"● Жду подтверждения на {self.mon_machine_name(server)}", C["accent"]
         else:
-            text, fg = (f"● Подключён к {self.mon_machine_name(server)}", C["mint"]) if df.get("connected") else \
-                       (f"● Подключаюсь к {self.mon_machine_name(server)}…", C["accent"])
+            text, fg = f"● Подключаюсь к {self.mon_machine_name(server)}…", C["accent"]
         lb.configure(text=text, fg=fg)
         for mid, b in ui.get("df_srv", {}).items():
             on = mid == server
@@ -3448,6 +3451,10 @@ class Panel:
         detail = []
         if df.get("err"):
             detail.append(clip(str(df["err"]), 160))
+        elif mode == "shared" and role == "client" and df.get("waiting_peer_trust") and not df.get("connected"):
+            detail.append(f"Этот компьютер уже доверяет {self.mon_machine_name(server)}. Теперь на "
+                          f"{self.mon_machine_name(server)} в панели нажми «Совпадает — доверять» "
+                          f"(сверь отпечаток с тем, что ниже)")
         elif mode == "shared" and df.get("running") and df.get("since"):
             detail.append(f"работает с {str(df['since'])[11:16]}")
         if mode != "shared" and comp.get("state") == "ok":

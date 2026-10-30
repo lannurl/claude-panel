@@ -363,7 +363,8 @@ class MonitorsCtl:
         return {"running": bool(st.get("running")), "role": st.get("role"), "connected": connected,
                 "since": st.get("since"), "fp_local": self._local_fp(), "pending_peer_fp": pending,
                 "peer_trusted": trusted, "err": err or st.get("err"), "log_tail": list(st.get("log_tail") or []),
-                "server": server, "last_switch": st.get("last_switch")}
+                "server": server, "last_switch": st.get("last_switch"),
+                "waiting_peer_trust": bool(st.get("waiting_peer_trust"))}
 
     def _snapshot(self):
         with self._lock:
