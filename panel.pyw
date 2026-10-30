@@ -16,18 +16,22 @@
 Лимиты: токен входа Claude Code читается из ~/.claude/.credentials.json (на macOS — из Связки ключей)
 и отправляется только на api.anthropic.com (тот же запрос, что делает /usage). История буфера — только в памяти.
 """
+import dataclasses
 import hashlib
 import io
 import json
 import os
 import queue
 import re
+import socket
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -53,7 +57,11 @@ def _optional(name):
 
 downloads = _optional("downloads")  # вкладка «Загрузки»
 dragout = _optional("dragout")      # перетаскивание файлов из панели (tkinterdnd2)
-monitor = _optional("monitor")      # вкладка «Сервер»
+monitor = _optional("monitor")      # вкладка «Сеть»: карточки серверов
+netinfo = _optional("netinfo")      # вкладка «Сеть»: шпаргалка сисадмина («Этот компьютер», «Проверка»)
+layout = _optional("layout")              # вкладка «Мониторы»: модель раскладки и геометрия (бэкенд)
+monitors_ctl = _optional("monitors_ctl")  # вкладка «Мониторы»: оркестратор (бэкенд)
+layout_editor = _optional("layout_editor")  # вкладка «Мониторы»: схема экранов на canvas
 
 
 def plat_fn(name):
@@ -68,20 +76,36 @@ if not plat.single_instance() and "--test" not in sys.argv:
 HERE = Path(__file__).resolve().parent
 
 
-def load_config():
-    """config.json рядом со скриптом — необязателен. Неверные значения игнорируются (берутся по умолчанию)."""
+CONFIG_PATH = HERE / "config.json"  # self_test подменяет на временную копию
+
+
+def load_config(errors=None):
+    """config.json рядом со скриптом — необязателен. Неверные значения игнорируются (берутся по умолчанию).
+
+    errors — список: если файл не читается как JSON-объект, туда попадает причина для пользователя
+    (горячая перезагрузка в этом случае оставляет прежние настройки).
+    """
     cfg = {"main_agent_name": "Claude", "hotkey": plat.HOTKEY_DEFAULT,
-           "notify": {"done": True, "sound": True, "permission": True}, "servers": []}
-    path = HERE / "config.json"
+           "notify": {"done": True, "sound": True, "permission": True}, "servers": [], "monitors": None}
+    path = CONFIG_PATH
     if not path.exists():
         return cfg
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        plat.log(f"config.json: ошибка JSON в строке {e.lineno} — настройки по умолчанию")
+        if errors is not None:
+            errors.append(f"ошибка в строке {e.lineno}")
+        return cfg
     except (OSError, ValueError) as e:
         plat.log(f"config.json не прочитан ({type(e).__name__}) — настройки по умолчанию")
+        if errors is not None:
+            errors.append("не прочитан (кодировка или доступ)" if isinstance(e, ValueError) else "не прочитан")
         return cfg
     if not isinstance(d, dict):
         plat.log("config.json: ожидается объект — настройки по умолчанию")
+        if errors is not None:
+            errors.append("ожидается объект { … }")
         return cfg
     name = d.get("main_agent_name")
     if isinstance(name, str) and name.strip():
@@ -105,6 +129,8 @@ def load_config():
             name = srv.get("name")
             entry["name"] = " ".join(name.split())[:32] if isinstance(name, str) and name.strip() else entry["host"]
             cfg["servers"].append(entry)
+    if isinstance(d.get("monitors"), dict):  # проверяет layout.parse_config (через MonitorsCtl), здесь — как есть
+        cfg["monitors"] = d["monitors"]
     return cfg
 
 
@@ -127,6 +153,21 @@ PERM_STALE = 5          # с: столько jsonl не менялся с нез
 IMG_MAX, IMG_BUDGET = 10, 200 * 1024 * 1024  # картинок в истории буфера и их суммарный объём в памяти (RGB)
 MULTI_LABEL = "⌘" if sys.platform == "darwin" else "Ctrl"  # множественный выбор в «Загрузках»
 DL_TICK = 3000          # мс: проверка папки «Загрузки»
+NET_REFRESH_MIN = 5     # с: local_info — не чаще
+PUBLIC_IP_TTL = 600     # с: внешний IP кешируется (запрос к api.ipify.org — только по кнопке)
+NET_HIST_MAX, NET_LOG_MAX = 5, 300  # недавних адресов «Проверки» / строк в окне вывода
+NET_ACTIONS = (("ping", "Ping"), ("trace", "Trace"), ("port", "Порт"), ("dns", "DNS"))
+NET_KIND = {"ethernet": "кабель", "wifi": "Wi-Fi", "vpn": "VPN", "other": "другое"}
+NET_OUT_HINT = "Введи адрес и нажми Ping (или Enter), Trace, Порт или DNS."
+CONFIG_TICK = 3000      # мс: проверка mtime config.json (горячая перезагрузка)
+MON_TICK = 1000         # мс: статус вкладки «Мониторы» (только когда она открыта)
+MON_ROLLBACK_S = 15     # с: «Применить к Windows» без «Оставить» откатывается (§7.5; откат делает MonitorsCtl)
+MON_LABEL_MAX = 32      # символов в подписи экрана
+MON_NAME_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]{0,62}")  # имя машины для Deskflow (§2.1)
+MON_OS = (("windows", "Windows"), ("macos", "macOS"), ("linux", "Linux"))
+MON_STATE = {"ok": ("установлен", "mint"), "missing": ("не установлен", "muted"), "old": ("старая версия", "accent"),
+             "unknown_dialect": ("версия не распознана", "accent"), "na": ("не нужен здесь", "muted"),
+             "unsupported": ("не поддерживается на этой ОС", "muted"), "conflict": ("конфликт", "red")}
 
 # Палитра «ночной офис»
 C = {
@@ -152,6 +193,41 @@ def open_vscode(cwd):
     if not cwd or not Path(cwd).exists():
         return "Папка сессии не найдена — открыть не получится"
     return plat.open_folder_in_code(os.path.abspath(cwd))
+
+
+def editor_fallback_cmd(path):
+    """Системный текстовый редактор, если VS Code нет: Windows — notepad.exe из System32 (абсолютный путь:
+    у .json часто нет связанной программы, и os.startfile падает), macOS — open -t, Linux — xdg-open."""
+    if sys.platform == "win32":
+        root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+        return [str(Path(root) / "System32" / "notepad.exe"), path]
+    if sys.platform == "darwin":
+        return ["open", "-t", path]
+    return ["xdg-open", path]
+
+
+def open_text_file(path):
+    """Открыть текстовый файл: VS Code (тот же поиск code, что для сессий), иначе системный редактор.
+
+    Возврат: (None, чем открыли) или (текст ошибки, None).
+    """
+    path = os.path.abspath(path)
+    code = getattr(plat, "CODE", None)
+    if code and os.path.isfile(code):
+        err = plat.open_folder_in_code(path)  # run_code([path]) / code path — с файлом работает так же
+        if err is None:
+            return None, "VS Code"
+        plat.log("open_text_file: VS Code не запустился — пробую системный редактор")
+    cmd = editor_fallback_cmd(path)
+    if sys.platform == "win32" and not os.path.isfile(cmd[0]):
+        return "Не найден ни VS Code, ни Блокнот", None
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         **({"creationflags": 0x08000000} if sys.platform == "win32" else {}))
+    except OSError as e:
+        plat.log(f"open_text_file: {Path(cmd[0]).name} — {type(e).__name__}")
+        return f"Не удалось открыть: нет VS Code, {Path(cmd[0]).name} не запустился", None
+    return None, {"win32": "Блокнот", "darwin": "текстовый редактор"}.get(sys.platform, "редактор по умолчанию")
 
 
 def open_session(cwd, session_id):
@@ -752,7 +828,7 @@ class Panel:
         self.dwell, self.frame = 0, 0
         self.last_inside = time.time()
         self.anim = None
-        self.tab = test_tab or "sessions"
+        self.tab = {"server": "net"}.get(test_tab, test_tab) or "sessions"  # «server» — старое имя вкладки
         self.history, self.paused = [], False
         self.clip_seq = plat.clipboard_seq(self.root)
         self.sessions, self.sess_sig, self.hits = [], None, []
@@ -788,10 +864,26 @@ class Panel:
             except Exception as e:
                 self.monitor, self.monitor_err = None, f"мониторинг не запустился ({type(e).__name__})"
                 plat.log(self.monitor_err)
+        # шпаргалка сисадмина (netinfo): сведения о сети и проверки; состояние переживает перестройку вкладки
+        self.net_ui, self.net_info, self.net_info_err = None, None, None
+        self.net_loading, self.net_info_req = False, 0.0  # local_info идёт в фоне / когда запрошен последний раз
+        self.net_pub, self.net_pub_loading, self.net_pub_err = (None, 0.0), False, False  # (ip, когда получен)
+        self.net_busy, self.net_cancel, self.net_log, self.net_hist = None, None, [], []
+        self.net_addr, self.net_port = tk.StringVar(self.root), tk.StringVar(self.root)
         self.snapping = False  # идёт скриншот области
+        self.flash_job, self.srv_rebuild = None, False
+        self.cfg_mtime = self.config_mtime()  # горячая перезагрузка config.json (tick_config)
+        # «Мониторы»: черновик раскладки и мастер переживают перестройку вкладки
+        self.mon_ctl, self.mon_err, self.mon_ui, self.mon_editor, self.mon_snap = None, None, None, None, {}
+        self.mon_draft, self.mon_dirty, self.mon_sel, self.mon_displays = None, False, None, None
+        self.mon_pending, self.mon_wiz, self.mon_hold, self.mon_pin_prev = None, None, set(), False
+        self.mon_detecting = False
+        self.mon_init(autostart=test_tab is None)  # в --test помощник краёв и режимы не запускаем
 
         for role in ("base", "small", "tiny", "bold", "track", "title", "mono", "num", "big"):
             setattr(self, f"f_{role}", self.make_font(*plat.FONTS[role]))
+        bold_fam, _, bold_kw = plat.FONTS["bold"]
+        self.f_tab_bold = self.make_font(bold_fam, plat.FONTS["small"][1], bold_kw)  # активная вкладка при 6 вкладках
 
         self.build()
         self.root.geometry(f"{self.W}x{self.H}+{self.x}+{self.y}")
@@ -807,7 +899,8 @@ class Panel:
         threading.Thread(target=self.recent.loop, daemon=True).start()
         for ms, fn in ((80, self.tick_mouse), (400, self.tick_clipboard), (100, self.tick_queue),
                        (140, self.tick_office), (50, self.tick_sessions), (500, self.tick_music),
-                       (DL_TICK, self.tick_downloads), (1000, self.tick_server)):
+                       (DL_TICK, self.tick_downloads), (1000, self.tick_server), (MON_TICK, self.tick_monitors),
+                       (CONFIG_TICK, self.tick_config)):
             self.root.after(ms, fn)
 
     def make_font(self, families, size, kw):
@@ -844,13 +937,17 @@ class Panel:
         tabs = [("sessions", "Сессии"), ("music", "Музыка"), ("clip", "Буфер")]
         if downloads:  # модуля нет — вкладку не показываем
             tabs.append(("downloads", "Загрузки"))
-        if monitor:
-            tabs.append(("server", "Сервер"))
-        pad = 10 if len(tabs) <= 3 else 7
+        if monitor or netinfo:
+            tabs.append(("net", "Сеть"))
+        if layout_editor:  # нет бэкенда (layout.py, monitors_ctl.py) — вкладка скажет «модуль не найден»
+            tabs.append(("monitors", "Мониторы"))
+        pad = 10 if len(tabs) <= 3 else 7 if len(tabs) <= 5 else 4
+        # 6 вкладок в 600 px: подписи мельче (§13 спецификации «Мониторов»)
+        self.f_tab, self.f_tab_on = (self.f_base, self.f_bold) if len(tabs) <= 5 else (self.f_small, self.f_tab_bold)
         for key, name in tabs:
             cell = tk.Frame(self.tabbar, bg=C["head"])
             cell.pack(side="left")
-            lb = tk.Label(cell, text=name, bg=C["head"], fg=C["muted"], font=self.f_base, padx=pad, pady=9, cursor="hand2",
+            lb = tk.Label(cell, text=name, bg=C["head"], fg=C["muted"], font=self.f_tab, padx=pad, pady=9, cursor="hand2",
                           takefocus=1)
             lb.pack()
             bar = tk.Frame(cell, bg=C["head"], height=2)
@@ -863,8 +960,13 @@ class Panel:
         self.head = head
         foot = tk.Frame(outer, bg=C["bg"])
         foot.pack(fill="x", side="bottom")
-        self.status = tk.Label(foot, text=HINT, bg=C["bg"], fg=C["muted"], font=self.f_tiny, pady=5)
-        self.status.pack()
+        line = tk.Frame(foot, bg=C["bg"])  # строка статуса по центру; справа от текста — кнопка действия flash
+        line.pack()
+        self.status = tk.Label(line, text=HINT, bg=C["bg"], fg=C["muted"], font=self.f_tiny, pady=5)
+        self.status.pack(side="left")
+        self.status_btn = tk.Label(line, text="", bg=C["item"], fg=C["ink"], font=self.f_tiny, padx=8, cursor="hand2",
+                                   takefocus=1, highlightthickness=1, highlightbackground=C["bg"],
+                                   highlightcolor=C["accent"])
         self.body = tk.Frame(outer, bg=C["bg"])
         self.body.pack(fill="both", expand=True)
         self.set_tab(self.tab)
@@ -985,20 +1087,42 @@ class Panel:
         lb.bind("<Button-1>", lambda e: cmd())
         return lb
 
-    def flash(self, text, color=None):
+    def flash(self, text, color=None, action=None):
+        """Сообщение в строке статуса на 2,2 с. action — (подпись, функция): кнопка рядом, сообщение висит 6 с."""
+        if self.flash_job:
+            self.root.after_cancel(self.flash_job)
         self.status.configure(text=text, fg=color or C["mint"])
-        self.root.after(2200, lambda: self.status.configure(text=HINT, fg=C["muted"]))
+        btn = self.status_btn
+        if action:
+            label, fn = action
+
+            def run(e=None):
+                self.flash_reset()
+                fn()
+            btn.configure(text=label)
+            for seq in ("<Button-1>", "<Return>", "<space>"):
+                btn.bind(seq, run)
+            btn.pack(side="left", padx=(6, 0))
+        else:
+            btn.pack_forget()
+        self.flash_job = self.root.after(6000 if action else 2200, self.flash_reset)
+
+    def flash_reset(self):
+        self.flash_job = None
+        self.status.configure(text=HINT, fg=C["muted"])
+        self.status_btn.pack_forget()
 
     def set_tab(self, key):
         self.tab = key
         for k, (lb, bar) in self.tabs.items():
             on = k == key
-            lb.configure(fg=C["ink"] if on else C["muted"], font=self.f_bold if on else self.f_base)
+            lb.configure(fg=C["ink"] if on else C["muted"], font=self.f_tab_on if on else self.f_tab)
             bar.configure(bg=C["accent"] if on else C["head"])
         self.video_off()
         for w in self.body.winfo_children():
             w.destroy()
-        self.office = self.limits_box = self.music_ui = self.dl_ui = self.srv_ui = None
+        self.office = self.limits_box = self.music_ui = self.dl_ui = self.srv_ui = self.net_ui = None
+        self.mon_ui = self.mon_editor = None
         getattr(self, f"tab_{key}")()
 
     def copy(self, text, note="Скопировано"):
@@ -1032,6 +1156,13 @@ class Panel:
                 self.monitor.stop()
             except Exception:
                 pass
+        if self.net_cancel is not None:  # идёт traceroute — пусть процесс завершится
+            self.net_cancel.set()
+        if self.mon_ctl:  # при stop_on_exit контроллер останавливает свои процессы
+            try:
+                self.mon_ctl.stop()
+            except Exception as e:
+                plat.log(f"monitors: stop — {type(e).__name__}")
         self.video_off()
         if self.mirror:
             try:
@@ -2220,28 +2351,546 @@ class Panel:
         self.dl_do_open(folder)
 
     # ── Вкладка: сервер ──
-    def tab_server(self):
+    # ── Вкладка: сеть (шпаргалка сисадмина + серверы) ──
+    def tab_net(self):
+        """Сверху вниз: «Этот компьютер», «Проверка» (netinfo.py), карточки серверов (monitor.py); всё — в одной прокрутке."""
+        area = self.scroll_area(self.body, key="net")
+        tk.Frame(area, bg=C["bg"], height=int(8 * self.s)).pack(fill="x")
+        if netinfo:
+            self.net_build(area)
+        if monitor:
+            self.server_block(area)
+
+    def net_head(self, parent, text, pady=(0, 4)):
+        bar = tk.Frame(parent, bg=C["bg"])
+        bar.pack(fill="x", pady=pady)
+        tk.Label(bar, text=text, bg=C["bg"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+        return bar
+
+    def net_button(self, parent, text, cmd, fg=None):
+        """Маленькая кнопка с клавиатурой: Tab — фокус (рамка), Enter/пробел — нажать."""
+        b = self.button(parent, text, cmd, small=True, fg=fg)
+        b.configure(takefocus=1, highlightthickness=1, highlightbackground=parent["bg"], highlightcolor=C["accent"])
+        if parent["bg"] == C["item"]:  # на карточке — своя подложка, иначе кнопка сливается с фоном
+            b.configure(bg=C["line"])
+            b.bind("<Leave>", lambda e: b.configure(bg=C["line"]))
+        b.bind("<Return>", lambda e: cmd())
+        b.bind("<space>", lambda e: cmd())
+        return b
+
+    def net_copy_label(self, parent, text, font, fg=None, value=None):
+        """Значение, которое копируется кликом (или Enter/пробелом с клавиатуры)."""
+        bg, fg, value = parent["bg"], fg or C["ink"], value or text
+        lb = tk.Label(parent, text=text, bg=bg, fg=fg, font=font, cursor="hand2", takefocus=1, padx=2,
+                      highlightthickness=1, highlightbackground=bg, highlightcolor=C["accent"])
+        for seq in ("<Button-1>", "<Return>", "<space>"):
+            lb.bind(seq, lambda e: self.copy(value, f"Скопировано: {clip(value, 48)}"))
+        lb.bind("<Enter>", lambda e: lb.configure(fg=C["mint"]))
+        lb.bind("<Leave>", lambda e: lb.configure(fg=fg))
+        return lb
+
+    def net_entry(self, parent, var, width=None):
+        ent = tk.Entry(parent, textvariable=var, bg=C["field"], fg=C["ink"], insertbackground=C["ink"], relief="flat",
+                       font=self.f_mono, highlightthickness=1, highlightbackground=C["line"], highlightcolor=C["accent"])
+        if width:
+            ent.configure(width=width)
+        return ent
+
+    def net_build(self, area):
+        ui = self.net_ui = {}
+        head = self.net_head(area, "ЭТОТ КОМПЬЮТЕР")
+        self.net_button(head, "↻", lambda: self.net_refresh(manual=True)).pack(side="right")
+        ui["state"] = tk.Label(head, text="", bg=C["bg"], fg=C["muted"], font=self.f_tiny, padx=8)
+        ui["state"].pack(side="right")
+        ui["local"] = tk.Frame(area, bg=C["item"])
+        ui["local"].pack(fill="x")
+        self.net_check_block(area)
+        self.net_render_local()
+        self.net_refresh()
+
+    # «Этот компьютер»
+    def net_refresh(self, manual=False):
+        """local_info в фоне — при показе вкладки и по ↻, не чаще раза в NET_REFRESH_MIN секунд."""
+        if not netinfo:
+            return
+        if self.net_loading:
+            if manual:
+                self.flash("Уже обновляю…", C["muted"])
+            return
+        if time.time() - self.net_info_req < NET_REFRESH_MIN:
+            if manual:
+                self.flash(f"Только что обновлено — не чаще раза в {NET_REFRESH_MIN} с", C["accent"])
+            return
+        self.net_loading, self.net_info_req = True, time.time()
+        self.net_paint_state()
+
+        def done(info, err):
+            self.net_loading = False
+            if err is not None:
+                plat.log(f"netinfo.local_info: {type(err).__name__}")
+                self.net_info_err = f"сведения о сети не получены ({type(err).__name__})"
+            elif not isinstance(info, dict):
+                self.net_info_err = "сведения о сети не получены"
+            else:
+                self.net_info, self.net_info_err = info, None
+            self.net_render_local()
+        self.run_bg(netinfo.local_info, done)
+
+    def net_paint_state(self):
+        ui = self.net_ui
+        if ui and ui["state"].winfo_exists():
+            ui["state"].configure(text="обновляю…" if self.net_loading else "")
+
+    def net_render_local(self):
+        ui = self.net_ui
+        if not ui or not ui["local"].winfo_exists():
+            return
+        self.net_paint_state()
+        box = ui["local"]
+        for w in box.winfo_children():
+            w.destroy()
+        info = self.net_info
+        if info is None:
+            err = self.net_info_err
+            tk.Label(box, text=err or "Собираю сведения о сети…", bg=C["item"], fg=C["red"] if err else C["muted"],
+                     font=self.f_small, anchor="w", padx=10, pady=10).pack(fill="x")
+            return
+        top = tk.Frame(box, bg=C["item"])
+        top.pack(fill="x", padx=10, pady=(8, 2))
+        left = tk.Frame(top, bg=C["item"])
+        left.pack(side="left", anchor="nw")
+        tk.Label(left, text=clip(info.get("hostname") or "имя компьютера неизвестно", 40), bg=C["item"], fg=C["ink"],
+                 font=self.f_bold, padx=2).pack(anchor="w")
+        ip = info.get("primary_ip")
+        if ip:
+            self.net_copy_label(left, ip, self.f_num, C["accent"]).pack(anchor="w")
+            hint = "основной IP · клик — скопировать"
+        else:
+            tk.Label(left, text="нет подключения", bg=C["item"], fg=C["red"], font=self.f_num, padx=2).pack(anchor="w")
+            hint = "исходящего интерфейса нет"
+        tk.Label(left, text=hint, bg=C["item"], fg=C["muted"], font=self.f_tiny, padx=2).pack(anchor="w")
+        ui["pub"] = tk.Frame(top, bg=C["item"])
+        ui["pub"].pack(side="right", anchor="ne")
+        self.net_render_pub()
+
+        active = [i for i in info.get("interfaces") or [] if isinstance(i, dict) and i.get("up")]
+        dns = [d for d in info.get("dns") or [] if isinstance(d, str)]
+        rows = [("Шлюз", info.get("gateway"), info.get("gateway")),
+                ("DNS", ", ".join(dns[:3]) + (f" +{len(dns) - 3}" if len(dns) > 3 else ""), ", ".join(dns))]
+        wifi = next((i for i in active if i.get("kind") == "wifi"), None)
+        if wifi:
+            rows.append(("Wi-Fi", wifi.get("ssid") or "", wifi.get("ssid")))
+        grid = tk.Frame(box, bg=C["item"])
+        grid.pack(fill="x", padx=10, pady=(6, 2))
+        for r, (name, text, value) in enumerate(rows):
+            tk.Label(grid, text=name, bg=C["item"], fg=C["muted"], font=self.f_small, anchor="w").grid(
+                row=r, column=0, sticky="w", padx=(2, 12))
+            if value:
+                self.net_copy_label(grid, text, self.f_mono, value=value).grid(row=r, column=1, sticky="w")
+            else:
+                empty = "подключено, имя сети не определено" if name == "Wi-Fi" else "—"
+                tk.Label(grid, text=empty, bg=C["item"], fg=C["muted"], font=self.f_small).grid(row=r, column=1, sticky="w")
+        self.net_ifaces(box, active)
+        err = info.get("err") or self.net_info_err
+        if err:
+            tk.Label(box, text=clip(str(err), 90), bg=C["item"], fg=C["red"], font=self.f_tiny, anchor="w",
+                     padx=12).pack(fill="x", pady=(0, 6))
+
+    def net_ifaces(self, box, active):
+        """Активные интерфейсы в одну строку каждый: имя, тип, IPv4 (клик — скопировать)."""
+        tk.Label(box, text="АКТИВНЫЕ ИНТЕРФЕЙСЫ", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w",
+                 padx=12).pack(fill="x", pady=(6, 0))
+        lst = tk.Frame(box, bg=C["item"])
+        lst.pack(fill="x", padx=10, pady=(0, 8))
+        if not active:
+            tk.Label(lst, text="активных интерфейсов нет", bg=C["item"], fg=C["muted"], font=self.f_small,
+                     padx=2).grid(row=0, column=0, sticky="w")
+            return
+        shown = active[:8]
+        for r, it in enumerate(shown):
+            tk.Label(lst, text=clip(str(it.get("name") or "?"), 30), bg=C["item"], fg=C["ink"], font=self.f_small,
+                     anchor="w", padx=2).grid(row=r, column=0, sticky="w")
+            tk.Label(lst, text=NET_KIND.get(it.get("kind"), "другое"), bg=C["item"], fg=C["violet"], font=self.f_tiny,
+                     anchor="w").grid(row=r, column=1, sticky="w", padx=10)
+            v4 = [a for a in it.get("ipv4") or [] if isinstance(a, str)]
+            cell = tk.Frame(lst, bg=C["item"])
+            cell.grid(row=r, column=2, sticky="w")
+            if v4:
+                self.net_copy_label(cell, v4[0], self.f_mono).pack(side="left")
+                if len(v4) > 1:
+                    tk.Label(cell, text=f"+{len(v4) - 1}", bg=C["item"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+            else:
+                tk.Label(cell, text="нет IPv4", bg=C["item"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+        if len(active) > len(shown):
+            tk.Label(lst, text=f"и ещё {len(active) - len(shown)}", bg=C["item"], fg=C["muted"], font=self.f_tiny,
+                     padx=2).grid(row=len(shown), column=0, sticky="w")
+
+    def net_render_pub(self):
+        """Внешний IP: только по кнопке (запрос к api.ipify.org), удачный ответ кешируется на PUBLIC_IP_TTL."""
+        ui = self.net_ui
+        if not ui or "pub" not in ui or not ui["pub"].winfo_exists():
+            return
+        box = ui["pub"]
+        for w in box.winfo_children():
+            w.destroy()
+        tk.Label(box, text="внешний IP", bg=C["item"], fg=C["muted"], font=self.f_tiny).pack(anchor="e")
+        ip, at = self.net_pub
+        if self.net_pub_loading:
+            tk.Label(box, text="запрашиваю…", bg=C["item"], fg=C["muted"], font=self.f_mono).pack(anchor="e")
+        elif ip and time.time() - at < PUBLIC_IP_TTL:
+            self.net_copy_label(box, ip, self.f_mono).pack(anchor="e")
+            tk.Label(box, text=f"получен в {datetime.fromtimestamp(at):%H:%M}", bg=C["item"], fg=C["muted"],
+                     font=self.f_tiny).pack(anchor="e")
+        else:
+            self.net_button(box, "показать" if not self.net_pub_err else "повторить", self.net_public).pack(anchor="e")
+            note, col = ("не удалось получить", C["red"]) if self.net_pub_err else ("запрос к api.ipify.org", C["muted"])
+            tk.Label(box, text=note, bg=C["item"], fg=col, font=self.f_tiny).pack(anchor="e")
+
+    def net_public(self):
+        if not netinfo or self.net_pub_loading:
+            return
+        ip, at = self.net_pub
+        if ip and time.time() - at < PUBLIC_IP_TTL:
+            return self.net_render_pub()
+        self.net_pub_loading, self.net_pub_err = True, False
+        self.net_render_pub()
+
+        def done(res, err):
+            self.net_pub_loading = False
+            if err is None and isinstance(res, str) and res:
+                self.net_pub = (res, time.time())
+            else:
+                self.net_pub_err = True
+                if err is not None:
+                    plat.log(f"netinfo.public_ip: {type(err).__name__}")
+            self.net_render_pub()
+        self.run_bg(lambda: netinfo.public_ip(timeout=4), done)
+
+    # «Проверка»
+    def net_check_block(self, area):
+        ui = self.net_ui
+        self.net_head(area, "ПРОВЕРКА", pady=(12, 4))
+        box = tk.Frame(area, bg=C["item"])
+        box.pack(fill="x")
+        row = tk.Frame(box, bg=C["item"])
+        row.pack(fill="x", padx=10, pady=(10, 4))
+        tk.Label(row, text="адрес", bg=C["item"], fg=C["muted"], font=self.f_small).pack(side="left")
+        ent = self.net_entry(row, self.net_addr)
+        ent.pack(side="left", fill="x", expand=True, ipady=3, padx=(6, 12))
+        tk.Label(row, text="порт", bg=C["item"], fg=C["muted"], font=self.f_small).pack(side="left")
+        port = self.net_entry(row, self.net_port, width=6)
+        port.pack(side="left", ipady=3, padx=(6, 0))
+        ent.bind("<Return>", lambda e: self.net_run("ping"))
+        port.bind("<Return>", lambda e: self.net_run("port"))
+        ui["entry"], ui["port"] = ent, port
+
+        btns = tk.Frame(box, bg=C["item"])
+        btns.pack(fill="x", padx=10, pady=4)
+        ui["btns"] = {}
+        for kind, text in NET_ACTIONS:
+            b = self.net_button(btns, text, lambda k=kind: self.net_run(k))
+            b.pack(side="left", padx=(0, 6))
+            ui["btns"][kind] = b
+        self.net_button(btns, "⧉ копировать", self.net_copy_out, fg=C["muted"]).pack(side="right")
+        ui["hist"] = tk.Frame(box, bg=C["item"])
+        ui["hist"].pack(fill="x", padx=10, pady=(2, 4))
+        self.net_render_hist()
+
+        out = tk.Text(box, height=8, bg=C["field"], fg=C["ink"], font=self.f_mono, relief="flat", wrap="word",
+                      padx=8, pady=6, highlightthickness=1, highlightbackground=C["line"], highlightcolor=C["accent"],
+                      insertbackground=C["ink"], selectbackground=C["hover"], takefocus=1, cursor="xterm")
+        for tag, col in (("ok", C["mint"]), ("warn", C["accent"]), ("bad", C["red"]), ("dim", C["muted"]),
+                         ("cmd", C["violet"])):
+            out.tag_configure(tag, foreground=col)
+        out.pack(fill="x", padx=10, pady=(4, 10))
+
+        def wheel(e):  # длинный вывод крутим сам, короткий — колесо уходит общей прокрутке вкладки
+            lo, hi = out.yview()
+            if hi - lo < 0.999:
+                out.yview_scroll(plat.wheel_units(e.delta), "units")
+                return "break"
+        out.bind("<MouseWheel>", wheel)
+        ui["out"] = out
+        self.net_out_redraw()
+        self.net_paint_buttons()
+
+    def net_render_hist(self):
+        """Последние адреса — «чипы»: клик (Enter/пробел) подставляет адрес в поле."""
+        ui = self.net_ui
+        if not ui or "hist" not in ui or not ui["hist"].winfo_exists():
+            return
+        box = ui["hist"]
+        for w in box.winfo_children():
+            w.destroy()
+        if not self.net_hist:
+            tk.Label(box, text="здесь появятся последние адреса", bg=C["item"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+            return
+        tk.Label(box, text="недавние:", bg=C["item"], fg=C["muted"], font=self.f_tiny).pack(side="left", padx=(0, 4))
+        for h in self.net_hist:
+            chip = tk.Label(box, text=clip(h, 22), bg=C["field"], fg=C["ink"], font=self.f_tiny, padx=8, pady=1,
+                            cursor="hand2", takefocus=1, highlightthickness=1, highlightbackground=C["item"],
+                            highlightcolor=C["accent"])
+            for seq in ("<Button-1>", "<Return>", "<space>"):
+                chip.bind(seq, lambda e, a=h: self.net_pick(a))
+            chip.pack(side="left", padx=(0, 4))
+
+    def net_pick(self, addr):
+        self.net_addr.set(addr)
+        ui = self.net_ui
+        if ui and ui["entry"].winfo_exists():
+            ui["entry"].focus_set()
+            ui["entry"].icursor("end")
+
+    def net_push_hist(self, host):
+        self.net_hist = [host] + [h for h in self.net_hist if h.lower() != host.lower()][:NET_HIST_MAX - 1]
+        self.net_render_hist()
+
+    def net_focus(self, key):
+        ui = self.net_ui
+        if ui and ui[key].winfo_exists():
+            ui[key].focus_set()
+
+    def net_host(self):
+        """Адрес из поля или None (с подсказкой). Вставленный URL сводится к имени хоста.
+        Полную проверку (допустимые символы и т.п.) делает netinfo — его ошибку покажем в выводе."""
+        raw = self.net_addr.get().strip()
+        if "://" in raw:
+            try:
+                raw = urllib.parse.urlsplit(raw).hostname or ""
+            except ValueError:
+                raw = ""
+        if not raw:
+            self.flash("Введи адрес: имя хоста или IP", C["red"])
+            self.net_focus("entry")
+            return None
+        if len(raw) > 253 or any(c.isspace() for c in raw):
+            self.flash("Адрес — без пробелов, не длиннее 253 символов", C["red"])
+            self.net_focus("entry")
+            return None
+        if raw != self.net_addr.get():
+            self.net_addr.set(raw)
+        return raw
+
+    def net_port_value(self):
+        s = self.net_port.get().strip()
+        if not (s.isascii() and s.isdigit() and 1 <= int(s) <= 65535):
+            self.flash("Порт — число от 1 до 65535", C["red"])
+            self.net_focus("port")
+            return None
+        return int(s)
+
+    def net_run(self, kind):
+        """Ping / Trace / Порт / DNS — в фоне; одновременно идёт одна проверка. Trace во время работы — «Стоп»."""
+        if not netinfo:
+            return
+        if self.net_busy:
+            if kind == "trace" and self.net_busy == "trace":
+                return self.net_stop()
+            name = dict(NET_ACTIONS).get(self.net_busy, self.net_busy)
+            return self.flash(f"Подожди: идёт {name}" + (" — его можно остановить" if self.net_busy == "trace" else ""),
+                              C["accent"])
+        host = self.net_host()
+        if host is None:
+            return
+        port = self.net_port_value() if kind == "port" else None
+        if kind == "port" and port is None:
+            return
+        self.net_push_hist(host)
+        self.net_busy = kind
+        self.net_log = []
+        self.net_paint_buttons()
+        if kind == "ping":
+            self.net_out(f"$ ping {host}", "cmd")
+            self.run_bg(lambda: netinfo.ping(host, count=4), self.net_ping_done)
+        elif kind == "trace":
+            self.net_out(f"$ traceroute {host}", "cmd")
+            self.net_cancel = cancel = threading.Event()
+            # on_hop зовётся из фонового потока — в Tk только через очередь (её разбирает tick_queue)
+            on_hop = lambda d: self.q.put(("call", self.net_hop, d, None))
+            self.run_bg(lambda: netinfo.traceroute(host, max_hops=20, on_hop=on_hop, cancel=cancel), self.net_trace_done)
+        elif kind == "port":
+            self.net_out(f"$ порт {f'[{host}]' if ':' in host else host}:{port}", "cmd")
+            self.run_bg(lambda: netinfo.check_port(host, port, timeout=3), self.net_port_done)
+        else:
+            self.net_out(f"$ dns {host}", "cmd")
+            self.run_bg(lambda: netinfo.dns_lookup(host), self.net_dns_done)
+
+    def net_stop(self):
+        if self.net_cancel is not None:
+            self.net_cancel.set()
+            self.net_paint_buttons()
+
+    def net_finish(self):
+        self.net_busy = None
+        self.net_paint_buttons()
+
+    def net_paint_buttons(self):
+        ui = self.net_ui
+        if not ui or "btns" not in ui:
+            return
+        for kind, b in ui["btns"].items():
+            if not b.winfo_exists():
+                continue
+            text, fg = dict(NET_ACTIONS)[kind], C["ink"]
+            if kind == "trace" and self.net_busy == "trace":
+                stopping = self.net_cancel is not None and self.net_cancel.is_set()
+                text, fg = ("останавливаю…", C["muted"]) if stopping else ("■ Стоп", C["red"])
+            elif kind == self.net_busy:
+                text, fg = text + " …", C["accent"]
+            elif self.net_busy:
+                fg = C["muted"]
+            b.configure(text=text, fg=fg)
+
+    def net_result_ok(self, res, err, what):
+        """Сбой вызова (исключение / не тот формат) — строка в вывод; True — результат можно разбирать."""
+        if err is not None:
+            plat.log(f"netinfo.{what}: {type(err).__name__}")
+            self.net_out(f"сбой проверки: {type(err).__name__}", "bad")
+            return False
+        if not isinstance(res, dict):
+            self.net_out("нет результата", "bad")
+            return False
+        return True
+
+    @staticmethod
+    def net_ms(v):
+        if not isinstance(v, (int, float)):
+            return "?"
+        return f"{v:.0f}" if v >= 10 or float(v).is_integer() else f"{v:.1f}"
+
+    def net_ping_done(self, res, err):
+        self.net_finish()
+        if not self.net_result_ok(res, err, "ping"):
+            return
+        sent, got, e = res.get("sent") or 0, res.get("received") or 0, res.get("err")
+        if e and not got and e != "нет ответа":  # адрес не принят / имя не найдено / нет утилиты
+            return self.net_out(f"ошибка: {e}", "bad")
+        loss = res.get("loss_pct")
+        if not isinstance(loss, (int, float)):
+            loss = (sent - got) * 100 / sent if sent else 100
+        line = f"{got}/{sent}, {self.net_ms(loss)}% потерь"
+        if got:
+            line += f", мин/ср/макс {self.net_ms(res.get('min'))}/{self.net_ms(res.get('avg'))}/{self.net_ms(res.get('max'))} мс"
+        elif e:
+            line += f" — {e}"
+        self.net_out(line, "ok" if got and not loss else "warn" if got else "bad")
+
+    def net_hop(self, d, _err):
+        """Хоп traceroute — по мере поступления (из очереди, уже в потоке Tk)."""
+        if not isinstance(d, dict):
+            return
+        if d.get("err"):
+            return self.net_out(f"ошибка: {d['err']}", "bad")
+        ms = d.get("ms")
+        host = d.get("host") or d.get("ip") or "*"
+        t = f"{self.net_ms(ms)} мс" if isinstance(ms, (int, float)) else "*"
+        self.net_out(f"{d.get('hop', '?'):>2}  {host:<15}  {t}", None if d.get("ip") else "dim")
+
+    def net_trace_done(self, hops, err):
+        stopped = self.net_cancel is not None and self.net_cancel.is_set()
+        self.net_cancel = None
+        self.net_finish()
+        if err is not None:
+            plat.log(f"netinfo.traceroute: {type(err).__name__}")
+            return self.net_out(f"сбой проверки: {type(err).__name__}", "bad")
+        hops = [h for h in hops or [] if isinstance(h, dict)]
+        n = sum(1 for h in hops if not h.get("err"))
+        count = f"{n} {plural(n, 'хоп', 'хопа', 'хопов')}"
+        if stopped:
+            self.net_out(f"— остановлено · {count}", "warn")
+        elif any(h.get("err") for h in hops):
+            pass  # ошибка уже выведена через on_hop
+        elif n:
+            self.net_out(f"— готово · {count}", "dim")
+        else:
+            self.net_out("— ни одного хопа", "warn")
+
+    def net_port_done(self, res, err):
+        self.net_finish()
+        if not self.net_result_ok(res, err, "check_port"):
+            return
+        if res.get("open"):
+            ms = res.get("ms")
+            return self.net_out("открыт" + (f" · {self.net_ms(ms)} мс" if isinstance(ms, (int, float)) else ""), "ok")
+        e = str(res.get("err") or "нет ответа")
+        self.net_out(e if e.startswith("закрыт") else f"закрыт ({e})", "bad")
+
+    def net_dns_done(self, res, err):
+        self.net_finish()
+        if not self.net_result_ok(res, err, "dns_lookup"):
+            return
+        v4 = [a for a in res.get("ipv4") or [] if isinstance(a, str)]
+        v6 = [a for a in res.get("ipv6") or [] if isinstance(a, str)]
+        for a in v4:
+            self.net_out(f"A     {a}", "ok")
+        for a in v6:
+            self.net_out(f"AAAA  {a}", "ok")
+        if not v4 and not v6:
+            self.net_out(f"ошибка: {res.get('err') or 'адресов нет'}", "bad")
+
+    # окно вывода: строки хранятся в self.net_log и переживают перестройку вкладки
+    def net_out_widget(self):
+        out = self.net_ui.get("out") if self.net_ui else None
+        return out if out is not None and out.winfo_exists() else None
+
+    def net_out(self, text, tag=None):
+        self.net_log.append((text, tag))
+        out = self.net_out_widget()
+        if len(self.net_log) > NET_LOG_MAX:
+            del self.net_log[:-NET_LOG_MAX]
+            return self.net_out_redraw()
+        if out is None:
+            return
+        if len(self.net_log) == 1:  # в окне ещё подсказка
+            return self.net_out_redraw()
+        out.configure(state="normal")
+        out.insert("end", "\n" + text, (tag,) if tag else ())
+        out.configure(state="disabled")
+        out.see("end")
+
+    def net_out_redraw(self):
+        out = self.net_out_widget()
+        if out is None:
+            return
+        out.configure(state="normal")
+        out.delete("1.0", "end")
+        if not self.net_log:
+            out.insert("end", NET_OUT_HINT, ("dim",))
+        for i, (text, tag) in enumerate(self.net_log):
+            out.insert("end", ("\n" if i else "") + text, (tag,) if tag else ())
+        out.configure(state="disabled")
+        out.see("end")
+
+    def net_copy_out(self):
+        if not self.net_log:
+            return self.flash("Вывод пуст — сначала запусти проверку", C["accent"])
+        self.copy("\n".join(t for t, _ in self.net_log), "Результат скопирован")
+
+    def server_block(self, parent):
+        """Карточки серверов (monitor.py) — нижняя часть вкладки «Сеть»."""
         ui = self.srv_ui = {"ago": []}
         servers = CONFIG["servers"]
+        bar = tk.Frame(parent, bg=C["bg"])
+        bar.pack(fill="x", pady=(14 if netinfo else 0, 4))
         if not servers:
-            return self.server_empty()
-        bar = tk.Frame(self.body, bg=C["bg"])
-        bar.pack(fill="x", padx=12, pady=(10, 4))
+            tk.Label(bar, text="СЕРВЕРЫ", bg=C["bg"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+            return self.server_empty(parent)
         tk.Label(bar, text=f"СЕРВЕРЫ · {len(servers)} · ping раз в 30 с, ssh раз в 2 мин", bg=C["bg"], fg=C["muted"],
                  font=self.f_tiny).pack(side="left")
         self.button(bar, "↻ обновить", self.server_refresh, small=True).pack(side="right")
-        ui["list"] = self.scroll_area(self.body, key="server")
+        ui["list"] = tk.Frame(parent, bg=C["bg"])
+        ui["list"].pack(fill="x")
         self.srv_sig = None
         self.server_render()
 
-    def server_empty(self):
-        box = tk.Frame(self.body, bg=C["bg"])
-        box.pack(fill="both", expand=True, padx=24, pady=20)
+    def server_empty(self, parent):
+        box = tk.Frame(parent, bg=C["bg"])
+        box.pack(fill="x", pady=(4, 10))
         tk.Label(box, text="Серверов для мониторинга нет", bg=C["bg"], fg=C["ink"], font=self.f_track).pack(anchor="w")
-        tk.Label(box, text="Добавь в config.json рядом с панелью список \"servers\" и перезапусти панель. "
+        tk.Label(box, text="Добавь в config.json рядом с панелью список \"servers\" — панель подхватит его сама. "
                  "\"ssh\" необязателен: без него сервер только пингуется; с ним (вход по ключу) видны "
                  "загрузка, память, диски и RAID.", bg=C["bg"], fg=C["muted"], font=self.f_small, justify="left",
-                 wraplength=int(540 * self.s)).pack(anchor="w", pady=(6, 10))
+                 wraplength=int(520 * self.s)).pack(anchor="w", pady=(6, 10))
         example = ('"servers": [\n'
                    '  {"name": "файл-сервер", "host": "192.0.2.10", "ssh": "admin@192.0.2.10"},\n'
                    '  {"name": "роутер", "host": "192.0.2.1"}\n'
@@ -2256,8 +2905,11 @@ class Panel:
             tk.Label(box, text="модуль monitor.py недоступен", bg=C["bg"], fg=C["red"], font=self.f_tiny).pack(anchor="w")
 
     def open_config(self):
-        """Открыть config.json; если его нет — создать из config.example.json."""
-        path = HERE / "config.json"
+        """Открыть config.json в VS Code или системном редакторе; если его нет — создать из config.example.json.
+
+        Не через dl_do_open/os.startfile: у .json в Windows часто нет связанной программы.
+        """
+        path = CONFIG_PATH
         if not path.exists():
             try:
                 example = HERE / "config.example.json"
@@ -2265,7 +2917,71 @@ class Panel:
                 path.write_text(text, encoding="utf-8")
             except OSError as e:
                 return self.flash(f"Не удалось создать config.json ({type(e).__name__})", C["red"])
-        self.dl_do_open(str(path))
+        err, how = open_text_file(str(path))
+        if err:
+            return self.flash(err, C["red"], action=("Показать в папке", lambda: self.dl_reveal(str(path))))
+        self.flash(f"Открываю config.json: {how} · изменения подхватятся сами")
+
+    # ── Горячая перезагрузка config.json ──
+    @staticmethod
+    def config_mtime():
+        try:
+            return CONFIG_PATH.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def tick_config(self):
+        m = self.config_mtime()
+        if m != self.cfg_mtime:
+            self.cfg_mtime = m
+            try:
+                self.reload_config()
+            except Exception as e:
+                plat.log(f"config.json: перезагрузка — {type(e).__name__}: {e}")
+        self.root.after(CONFIG_TICK, self.tick_config)
+
+    def reload_config(self):
+        """Перечитать config.json. Битый JSON — сообщение, прежние настройки остаются.
+
+        servers — Monitor пересоздаётся; notify — сразу (читается при каждом уведомлении); main_agent_name —
+        при следующей перерисовке офиса; hotkey — только после перезапуска; monitors — секцию пишет сам
+        MonitorsCtl (save_layout), здесь только обновляется копия.
+        """
+        global MAIN_AGENT
+        errors = []
+        new = load_config(errors)
+        if errors:
+            return self.flash(f"config.json: {errors[0]} — оставлены прежние настройки", C["red"])
+        old = dict(CONFIG)
+        CONFIG.clear()
+        CONFIG.update(new)
+        changed = [k for k in ("main_agent_name", "notify", "servers") if old.get(k) != new.get(k)]
+        if old.get("servers") != new.get("servers"):
+            self.monitor_restart()
+        MAIN_AGENT = CONFIG["main_agent_name"]
+        if old.get("hotkey") != new.get("hotkey"):
+            CONFIG["hotkey"] = old.get("hotkey")  # поток горячей клавиши уже запущен (или нет) — до перезапуска как было
+            self.flash("config.json: hotkey применится после перезапуска панели", C["accent"])
+        elif changed:
+            names = {"main_agent_name": "имя агента", "notify": "уведомления", "servers": "серверы"}
+            self.flash("config.json перечитан: " + ", ".join(names[k] for k in changed))
+
+    def monitor_restart(self):
+        """Серверы в config изменились: старый Monitor — stop, новый — start; вкладка «Сеть» перестроится."""
+        if self.monitor:
+            try:
+                self.monitor.stop()
+            except Exception as e:
+                plat.log(f"monitor.stop: {type(e).__name__}")
+        self.monitor, self.monitor_err = None, None
+        if monitor and CONFIG["servers"]:
+            try:
+                self.monitor = monitor.Monitor(CONFIG["servers"])
+                self.monitor.start()
+            except Exception as e:
+                self.monitor, self.monitor_err = None, f"мониторинг не запустился ({type(e).__name__})"
+                plat.log(self.monitor_err)
+        self.srv_rebuild = True  # перестроить «Сеть», когда там не идёт проверка (tick_server)
 
     def server_refresh(self):
         if self.monitor:
@@ -2389,6 +3105,1014 @@ class Panel:
         tk.Label(line, text=txt, bg=C["item"], fg=col if pct is not None and pct > 75 else C["ink"], font=self.f_tiny).pack(side="left")
 
     # ── Показ и скрытие ──
+    # ── Вкладка: мониторы ──
+    # Схема — layout_editor.py; модель и геометрия — layout.py; всё остальное — только через MonitorsCtl
+    # (monitors_ctl.py). Контракты — docs/monitors-spec.md §5, вёрстка — §15.1.
+    def mon_init(self, autostart):
+        """Создать MonitorsCtl, если бэкенд на месте. Нет модулей или конструктор упал — вкладка покажет причину."""
+        self.mon_save_warn, self.mon_paste_armed, self.mon_answered = [], 0.0, set()  # answered — токены отката
+        if not (layout and monitors_ctl and layout_editor):
+            return
+        data_dir = getattr(plat, "DATA_DIR", None)
+        if data_dir is None:
+            self.mon_err = "в platform-слое нет DATA_DIR (блок «Мониторы» ещё не добавлен)"
+            plat.log(f"monitors: {self.mon_err}")
+            return
+        try:
+            self.mon_ctl = monitors_ctl.MonitorsCtl(
+                CONFIG["monitors"], CONFIG_PATH, Path(data_dir) / "monitors", plat,
+                on_event=lambda kind, payload: self.q.put(("monitors", kind, payload)))
+        except Exception as e:
+            self.mon_err = f"не запустились ({type(e).__name__})"
+            plat.log(f"monitors: MonitorsCtl — {type(e).__name__}: {e}")
+            return
+        if autostart:
+            try:
+                self.mon_ctl.start()
+            except Exception as e:
+                plat.log(f"monitors: start — {type(e).__name__}: {e}")
+
+    def mon_call(self, name, *args):
+        """Метод MonitorsCtl без исключений наружу: сбой — словарь ошибки, как в §2.3."""
+        fn = getattr(self.mon_ctl, name, None) if self.mon_ctl else None
+        if not callable(fn):
+            return {"ok": False, "code": "not_found", "err": "функция недоступна в этой версии"}
+        try:
+            return fn(*args)
+        except Exception as e:
+            plat.log(f"monitors: {name} — {type(e).__name__}: {e}")
+            return {"ok": False, "code": "os_error", "err": f"внутренняя ошибка ({type(e).__name__})"}
+
+    @staticmethod
+    def mon_ok(res):
+        return isinstance(res, dict) and res.get("ok") is True
+
+    def mon_fail(self, res, what):
+        err = res.get("err") if isinstance(res, dict) else None
+        hint = res.get("hint") if isinstance(res, dict) else None
+        self.flash(clip(f"{what}: {err or 'не получилось'}" + (f" — {hint}" if hint else ""), 110), C["red"])
+
+    def mon_load_layout(self):
+        lay = self.mon_call("layout")
+        return lay if layout and isinstance(lay, layout.Layout) else None
+
+    def mon_refresh_snap(self):
+        snap = self.mon_call("snapshot")
+        if isinstance(snap, dict) and snap.get("ok") is not False:
+            self.mon_snap = snap
+
+    def mon_this(self):
+        """id этой машины (из snapshot), если она есть в черновике раскладки."""
+        me = self.mon_snap.get("this_machine")
+        lay = self.mon_draft
+        return me if lay and any(m.id == me for m in lay.machines) else None
+
+    def mon_screen(self, sid):
+        lay = self.mon_draft
+        return next((s for s in lay.screens if s.id == sid), None) if lay and sid else None
+
+    def mon_machine_name(self, mid):
+        lay = self.mon_draft
+        m = next((m for m in lay.machines if m.id == mid), None) if lay else None
+        return m.name if m else mid
+
+    @staticmethod
+    def mon_os_name():
+        return "Windows" if sys.platform == "win32" else "macOS"
+
+    # мелкие элементы в стиле вкладки «Сеть», но свои — блок «Сеть» не трогаем
+    def mon_head(self, parent, text, pady=(0, 4)):
+        bar = tk.Frame(parent, bg=C["bg"])
+        bar.pack(fill="x", pady=pady)
+        tk.Label(bar, text=text, bg=C["bg"], fg=C["muted"], font=self.f_tiny).pack(side="left")
+        return bar
+
+    def mon_button(self, parent, text, cmd, fg=None, primary=False):
+        """Маленькая кнопка с клавиатурой: Tab — фокус (рамка), Enter/пробел — нажать."""
+        b = self.button(parent, text, cmd, small=True, fg=fg, primary=primary, font=self.f_small if primary else None)
+        b.configure(takefocus=1, highlightthickness=1, highlightbackground=parent["bg"], highlightcolor=C["ink"])
+        if parent["bg"] == C["item"] and not primary:  # на карточке — своя подложка
+            b.configure(bg=C["line"])
+            b.bind("<Leave>", lambda e: b.configure(bg=C["line"]))
+        b.bind("<Return>", lambda e: cmd())
+        b.bind("<space>", lambda e: cmd())
+        return b
+
+    def mon_entry(self, parent, var, width=None):
+        ent = tk.Entry(parent, textvariable=var, bg=C["field"], fg=C["ink"], insertbackground=C["ink"], relief="flat",
+                       font=self.f_mono, highlightthickness=1, highlightbackground=C["line"], highlightcolor=C["accent"],
+                       disabledbackground=C["item"], disabledforeground=C["muted"])
+        if width:
+            ent.configure(width=width)
+        return ent
+
+    def mon_note(self, parent, text, fg=None, font=None):
+        lb = tk.Label(parent, text=text, bg=parent["bg"], fg=fg or C["muted"], font=font or self.f_tiny, anchor="w",
+                      justify="left", wraplength=int(540 * self.s))
+        lb.pack(fill="x")
+        return lb
+
+    def tab_monitors(self):
+        area = self.scroll_area(self.body, key="monitors")
+        tk.Frame(area, bg=C["bg"], height=int(8 * self.s)).pack(fill="x")
+        self.mon_ui = {"area": area}
+        miss = [f for f, m in (("layout.py", layout), ("monitors_ctl.py", monitors_ctl)) if m is None]
+        if miss or not self.mon_ctl:
+            return self.mon_unavailable(area, miss)
+        self.mon_refresh_snap()
+        if self.mon_draft is None and self.mon_wiz is None:
+            self.mon_draft, self.mon_dirty = self.mon_load_layout(), False
+            if self.mon_draft is None:  # секции monitors нет — мастер первого запуска
+                self.mon_wiz = self.mon_wiz_new()
+        if self.mon_wiz is not None:
+            return self.mon_wizard(area)
+        self.mon_build(area)
+
+    def mon_unavailable(self, area, miss):
+        box = tk.Frame(area, bg=C["item"])
+        box.pack(fill="x")
+        inner = tk.Frame(box, bg=C["item"])
+        inner.pack(fill="x", padx=12, pady=10)
+        if miss:
+            self.mon_note(inner, "Модуль не найден", C["accent"], self.f_bold)
+            self.mon_note(inner, f"Рядом с панелью нет: {', '.join(miss)}. Схема экранов и помощник курсора "
+                                 "заработают, когда эти файлы появятся (обнови панель).", C["ink"], self.f_small)
+        else:
+            self.mon_note(inner, "Мониторы недоступны", C["accent"], self.f_bold)
+            self.mon_note(inner, f"Модули на месте, но {self.mon_err or 'контроллер не создан'}. "
+                                 "Подробности — в журнале панели (stderr).", C["ink"], self.f_small)
+
+    # главный вид: режимы, схема, свойства экрана, кнопки, помощник
+    def mon_build(self, area):
+        ui = self.mon_ui
+        ui["banner"] = tk.Frame(area, bg=C["bg"])
+        ui["banner"].pack(fill="x")
+        self.mon_paint_banner()
+        self.mon_modes(area)
+        if not self.mon_this():
+            self.mon_pick_machine(area)
+        head = self.mon_head(area, "РАСКЛАДКА — КАК НА СТОЛЕ", pady=(10, 4))
+        ui["detect"] = self.mon_button(head, "Определить экраны", self.mon_detect)
+        ui["detect"].pack(side="right")
+        ui["dirty"] = tk.Label(head, text="", bg=C["bg"], fg=C["accent"], font=self.f_tiny, padx=8)
+        ui["dirty"].pack(side="right")
+        try:
+            ed = layout_editor.LayoutEditor(area, colors=C, fonts=self.mon_fonts(), scale=self.s,
+                                            on_change=self.mon_changed, on_select=self.mon_selected,
+                                            on_drag=lambda on: self.mon_set_hold("drag", on), height=230)
+        except Exception as e:
+            plat.log(f"monitors: LayoutEditor — {type(e).__name__}: {e}")
+            return self.mon_note(area, f"Схема не построилась ({type(e).__name__})", C["red"], self.f_small)
+        ed.pack(fill="x")
+        self.mon_editor = ed
+        ed.set_layout(self.mon_draft)
+        ed.select(self.mon_sel)
+        self.mon_legend(area)
+        self.mon_props(area)
+        ui["warn"] = tk.Label(area, text="", bg=C["bg"], fg=C["accent"], font=self.f_tiny, anchor="w", justify="left",
+                              wraplength=int(560 * self.s))
+        ui["warn"].pack(fill="x", pady=(4, 0))
+        row = tk.Frame(area, bg=C["bg"])
+        row.pack(fill="x", pady=(6, 0))
+        self.mon_button(row, "Сохранить", self.mon_save, primary=True).pack(side="left")
+        self.mon_button(row, f"Применить к {self.mon_os_name()}", self.mon_apply_os).pack(side="left", padx=(6, 0))
+        self.mon_button(row, "Вставить раскладку", self.mon_paste_layout).pack(side="right")
+        self.mon_button(row, "Копировать раскладку", self.mon_copy_layout).pack(side="right", padx=(0, 6))
+        self.mon_helper(area)
+        tk.Frame(area, bg=C["bg"], height=int(8 * self.s)).pack(fill="x")
+        self.mon_paint_dirty()
+        self.mon_paint_warn()
+        self.mon_paint_props()
+        self.mon_paint_status()
+        if self.mon_displays is None:  # EDID для кнопки «из EDID» и метки «курсор здесь»
+            self.mon_fetch_displays(merge=False)
+
+    def mon_fonts(self):
+        return {"small": self.f_small, "tiny": self.f_tiny, "bold": self.f_bold}
+
+    def mon_modes(self, area):
+        """Полоса режимов. На этапе 1 работает только «Выкл» (свои экраны); остальное — заготовки со статусом."""
+        ui = self.mon_ui
+        self.mon_head(area, "РЕЖИМЫ")
+        row = tk.Frame(area, bg=C["bg"])
+        row.pack(fill="x")
+        ui["modes"] = {}
+        for key, title in (("off", "Выкл"), ("shared", "Общая мышь (Deskflow)"), ("monitor", "Ноут как монитор")):
+            cell = tk.Frame(row, bg=C["item"], highlightthickness=1, highlightbackground=C["item"])
+            cell.pack(side="left", fill="both", expand=True, padx=(0 if key == "off" else 4, 0))
+            soon = key != "off"
+            t = tk.Label(cell, text=title + (" · скоро" if soon else ""), bg=C["item"], fg=C["ink"], font=self.f_small,
+                         anchor="w", padx=8, pady=2)
+            t.pack(fill="x", pady=(3, 0))
+            sub = tk.Label(cell, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w", justify="left",
+                           padx=8, wraplength=int(170 * self.s))
+            sub.pack(fill="x", pady=(0, 4))
+            ui["modes"][key] = (cell, t, sub)
+        ui["mode_line"] = tk.Label(area, text="", bg=C["bg"], fg=C["muted"], font=self.f_tiny, anchor="w")
+        ui["mode_line"].pack(fill="x", pady=(2, 0))
+
+    def mon_comp(self, name):
+        """(текст, цвет) состояния компонента из snapshot()["components"] (§5.5.1)."""
+        comp = (self.mon_snap.get("components") or {}).get(name)
+        if not isinstance(comp, dict):
+            return "статус неизвестен", C["muted"]
+        st = comp.get("state")
+        text, col = MON_STATE.get(st, ("статус неизвестен", "muted"))
+        if st == "ok" and comp.get("version"):
+            text = f"{text} {comp['version']}"
+        elif st == "na" and comp.get("note"):
+            text = str(comp["note"])
+        elif st == "missing" and comp.get("admin_to_install"):
+            text += " (нужен администратор)"
+        return text, C[col]
+
+    def mon_pick_machine(self, area):
+        """this_machine не определился по hostname — спросить, какой компьютер схемы этот (§4)."""
+        box = tk.Frame(area, bg=C["item"], highlightthickness=1, highlightbackground=C["accent"])
+        box.pack(fill="x", pady=(8, 0))
+        inner = tk.Frame(box, bg=C["item"])
+        inner.pack(fill="x", padx=10, pady=8)
+        self.mon_note(inner, "Какой компьютер на схеме — этот? От этого зависят «Определить экраны» и помощник курсора.",
+                      C["ink"], self.f_small)
+        row = tk.Frame(inner, bg=C["item"])
+        row.pack(fill="x", pady=(6, 0))
+        for m in self.mon_draft.machines:
+            self.mon_button(row, f"{m.name} ({m.hostname or 'имя неизвестно'})",
+                            lambda mid=m.id: self.mon_set_this(mid)).pack(side="left", padx=(0, 6))
+
+    def mon_set_this(self, mid):
+        res = self.mon_call("set_this_machine", mid)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Не запомнил")
+        self.mon_refresh_snap()
+        self.set_tab("monitors")
+
+    def mon_legend(self, area):
+        row = tk.Frame(area, bg=area["bg"])
+        row.pack(fill="x", pady=(3, 0))
+        for text, fg in (("━ напротив", C["mint"]), ("━ в ближайший угол", C["accent"]), ("┄ стена", C["red"])):
+            tk.Label(row, text=text, bg=area["bg"], fg=fg, font=self.f_tiny, padx=0).pack(side="left", padx=(0, 10))
+        tk.Label(row, text="· наведи на край — увидишь, куда выйдет курсор", bg=area["bg"], fg=C["muted"],
+                 font=self.f_tiny).pack(side="left")
+        tk.Label(area, text="Перетаскивай мышью — края притягиваются (Shift — без привязки). Клавиатура: Tab к схеме, "
+                            "пробел — следующий экран, стрелки — сдвиг на 1 см (Shift — на 1 мм).",
+                 bg=area["bg"], fg=C["muted"], font=self.f_tiny, anchor="w", justify="left",
+                 wraplength=int(540 * self.s)).pack(fill="x")
+
+    def mon_props(self, area):
+        """Свойства выбранного экрана: подпись и размер (SizeForm из layout_editor)."""
+        ui = self.mon_ui
+        box = tk.Frame(area, bg=C["item"])
+        box.pack(fill="x", pady=(6, 0))
+        inner = tk.Frame(box, bg=C["item"])
+        inner.pack(fill="x", padx=10, pady=7)
+        top = tk.Frame(inner, bg=C["item"])
+        top.pack(fill="x", pady=(0, 5))
+        ui["sel_title"] = tk.Label(top, text="", bg=C["item"], fg=C["ink"], font=self.f_bold, anchor="w")
+        ui["sel_title"].pack(side="left")
+        ui["label_var"] = tk.StringVar(self.root)
+        ent = self.mon_entry(top, ui["label_var"], 18)
+        ent.pack(side="right")
+        ent.bind("<Return>", lambda e: self.mon_rename())
+        ent.bind("<FocusOut>", lambda e: self.mon_rename())
+        ui["label_ent"] = ent
+        tk.Label(top, text="Подпись", bg=C["item"], fg=C["muted"], font=self.f_small, padx=6).pack(side="right")
+        ui["size"] = layout_editor.SizeForm(inner, colors=C, fonts=self.mon_fonts(), make_button=self.mon_button,
+                                            make_entry=self.mon_entry, on_apply=self.mon_apply_size)
+        ui["size"].pack(fill="x")
+
+    def mon_helper(self, area):
+        """Переключатель помощника краёв (§7.4): выкл по умолчанию, при включении — статус и пауза."""
+        ui = self.mon_ui
+        self.mon_head(area, "ПОМОЩНИК КУРСОРА (СВОИ МОНИТОРЫ)", pady=(12, 4))
+        box = tk.Frame(area, bg=C["item"])
+        box.pack(fill="x")
+        inner = tk.Frame(box, bg=C["item"])
+        inner.pack(fill="x", padx=10, pady=7)
+        row = tk.Frame(inner, bg=C["item"])
+        row.pack(fill="x")
+        tg = tk.Label(row, text="", bg=C["item"], fg=C["ink"], font=self.f_bold, cursor="hand2", takefocus=1, padx=2,
+                      highlightthickness=1, highlightbackground=C["item"], highlightcolor=C["accent"])
+        for seq in ("<Button-1>", "<Return>", "<space>"):
+            tg.bind(seq, lambda e: self.mon_toggle_edge())
+        tg.pack(side="left")
+        ui["edge_toggle"] = tg
+        ui["edge_pause"] = self.mon_button(row, "Пауза", self.mon_pause_edge)  # пауза без выключения (config не меняется)
+        ui["edge_status"] = tk.Label(row, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, padx=10)
+        ui["edge_status"].pack(side="left")
+        self.mon_note(inner, "Курсор переходит между экранами этого компьютера по реальным размерам: напротив, "
+                             "а из пустой зоны — в ближайший угол (линии на схеме). Сторонние программы не нужны; "
+                             "работает по сохранённой раскладке.")
+
+    # отрисовка состояния (без перестройки вкладки)
+    def mon_paint_status(self):
+        ui = self.mon_ui
+        if not ui or "modes" not in ui or not ui["mode_line"].winfo_exists():
+            return
+        self.mon_refresh_snap()
+        snap = self.mon_snap
+        mode = snap.get("mode") or "off"
+        df_text, df_col = self.mon_comp("deskflow")
+        subs = {"off": ("только свои экраны", C["muted"]),
+                "shared": (f"Deskflow: {df_text}", df_col),
+                "monitor": (f"Apollo: {self.mon_comp('apollo')[0]} · Moonlight: {self.mon_comp('moonlight')[0]}",
+                            C["muted"])}
+        for key, (cell, t, sub) in ui["modes"].items():
+            on = key == mode
+            cell.configure(highlightbackground=C["accent"] if on else C["item"])
+            t.configure(fg=C["accent"] if on else (C["ink"] if key == "off" else C["muted"]))
+            sub.configure(text=subs[key][0], fg=subs[key][1])
+        pend = snap.get("os_positions_pending")  # плашка отката переживает перестройку вкладки
+        if isinstance(pend, dict) and pend.get("token") and not self.mon_pending:
+            self.mon_start_pending(pend["token"], pend.get("deadline_s", MON_ROLLBACK_S))
+        if snap.get("busy"):
+            ui["mode_line"].configure(text=snap.get("busy_text") or "Выполняю…", fg=C["accent"])
+        else:
+            ui["mode_line"].configure(text="Переходы на другой компьютер — в следующих версиях. Сейчас: схема и помощник "
+                                           "курсора для своих экранов.", fg=C["muted"])
+        self.mon_paint_edge()
+
+    def mon_paint_edge(self):
+        ui = self.mon_ui
+        tg = ui.get("edge_toggle") if ui else None
+        if not tg or not tg.winfo_exists():
+            return
+        edge = self.mon_snap.get("edge") or {}
+        comp = (self.mon_snap.get("components") or {}).get("edge") or {}
+        running = bool(edge.get("running"))
+        enabled = bool(edge.get("enabled", running))  # enabled — в config; running — поток помощника жив
+        tg.configure(text="● Помощник включён" if enabled else "○ Помощник выключен",
+                     fg=C["mint"] if enabled else C["ink"])
+        ui["edge_pause"].configure(text="Продолжить" if edge.get("user_paused") else "Пауза")
+        if enabled:
+            ui["edge_pause"].pack(side="right")
+        else:
+            ui["edge_pause"].pack_forget()
+        if comp.get("state") in ("unsupported", "missing"):
+            text, fg = "недоступен на этом компьютере", C["muted"]
+        elif edge.get("err"):
+            text, fg = clip(f"ошибка: {edge['err']}", 70), C["red"]
+        elif running and edge.get("client_state") == "client_absolute":  # §7.4.1: курсором ведёт главный (Deskflow)
+            text, fg = "пауза: курсором управляет главный компьютер — для переходов по размерам нажми там Ctrl+Alt+Shift+A", C["accent"]
+        elif running and edge.get("user_paused"):
+            text, fg = "на паузе — нажми «Продолжить»", C["accent"]
+        elif running and edge.get("paused"):
+            text, fg = "на паузе", C["accent"]
+        elif running:
+            n = int(edge.get("warps") or 0)
+            text = f"работает · {n} {plural(n, 'переход', 'перехода', 'переходов')} поправлено"
+            if comp.get("raw_input") is False:
+                text += " · «дожим» в край недоступен"
+            fg = C["mint"]
+        elif enabled:
+            text, fg = "включён, но не запущен — проверь раскладку (предупреждения выше)", C["accent"]
+        else:
+            text = ("переходы делает Windows — «пиксель в пиксель»" if sys.platform == "win32"
+                    else "переходы делает система — «пиксель в пиксель»")
+            fg = C["muted"]
+        me = self.mon_this()
+        if me and self.mon_draft and sum(s.machine == me for s in self.mon_draft.screens) < 2:
+            text = "у этого компьютера один экран — помощнику нечего делать"
+        ui["edge_status"].configure(text=text, fg=fg)
+
+    def mon_toggle_edge(self):
+        edge = self.mon_snap.get("edge") or {}
+        want = not bool(edge.get("enabled", edge.get("running")))
+        if want and self.mon_dirty:
+            self.flash("Помощник работает по сохранённой раскладке — сначала «Сохранить»", C["accent"])
+        res = self.mon_call("set_edge_helper", want)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Помощник не " + ("включён" if want else "выключен"))
+        self.mon_refresh_snap()
+        self.mon_paint_edge()
+        if not self.mon_dirty or not want:
+            self.flash("Помощник курсора включён" if want else "Помощник курсора выключен")
+
+    def mon_pause_edge(self):
+        want = not bool((self.mon_snap.get("edge") or {}).get("user_paused"))
+        res = self.mon_call("pause_edge_helper", want)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Пауза не " + ("включена" if want else "снята"))
+        self.mon_refresh_snap()
+        self.mon_paint_edge()
+        self.flash("Помощник курсора на паузе" if want else "Помощник курсора снова работает")
+
+    def mon_list_displays(self):
+        """Экраны ОС: refresh_displays() перечитывает их синхронно (~2 мс, start() не нужен); старый бэкенд — кэш."""
+        res = self.mon_call("refresh_displays")
+        return self.mon_call("local_displays") if isinstance(res, dict) and res.get("code") == "not_found" else res
+
+    def mon_paint_dirty(self):
+        lb = self.mon_ui.get("dirty") if self.mon_ui else None
+        if lb and lb.winfo_exists():
+            lb.configure(text="● не сохранено" if self.mon_dirty else "")
+
+    def mon_paint_warn(self):
+        lb = self.mon_ui.get("warn") if self.mon_ui else None
+        if not lb or not lb.winfo_exists():
+            return
+        warns = []
+        try:
+            warns += list(layout.validate(self.mon_draft)) if self.mon_draft else []
+        except Exception as e:
+            plat.log(f"monitors: validate — {type(e).__name__}")
+        if not self.mon_dirty:
+            warns += list(self.mon_snap.get("warnings") or []) + list(self.mon_save_warn)
+        warns = list(dict.fromkeys(str(w) for w in warns))
+        more = f"\n…и ещё {len(warns) - 3}" if len(warns) > 3 else ""
+        lb.configure(text="\n".join(f"⚠ {clip(w, 110)}" for w in warns[:3]) + more if warns else "")
+
+    def mon_paint_props(self):
+        ui = self.mon_ui
+        if not ui or "size" not in ui or not ui["size"].winfo_exists():
+            return
+        s = self.mon_screen(self.mon_sel)
+        if s:
+            where = "этот компьютер" if s.machine == self.mon_this() else self.mon_machine_name(s.machine)
+            ui["sel_title"].configure(text=clip(f"{s.label} · {where}", 34), fg=C["ink"])
+            ui["label_ent"].configure(state="normal")
+            ui["label_var"].set(s.label)
+            ui["label_for"] = s.id  # поле подписи заполнено для этого экрана
+        else:
+            ui["label_for"] = None
+            ui["sel_title"].configure(text="Экран не выбран", fg=C["muted"])
+            ui["label_var"].set("")
+            ui["label_ent"].configure(state="disabled")
+        ui["size"].set_screen(s, self.mon_edid_for(s))
+
+    def mon_edid_for(self, s):
+        """Размер из EDID для экрана этой машины (по os_id из local_displays), иначе None."""
+        if not s or s.machine != self.mon_this() or not s.os_id:
+            return None
+        d = next((d for d in self.mon_displays or [] if d["os_id"] == s.os_id), None)
+        return d["size_mm"] if d else None
+
+    def mon_track_cursor(self):
+        """Метка «курсор здесь» на экране этой машины, где сейчас курсор (os_rect_px — в координатах ОС)."""
+        ed, me, lay = self.mon_editor, self.mon_this(), self.mon_draft
+        if not ed or not ed.winfo_exists() or not me or not lay:
+            return
+        try:
+            x, y = plat.cursor_pos(self.root)
+        except Exception:
+            return
+        cur = None
+        for s in lay.screens:
+            r = s.os_rect_px
+            if s.machine == me and r and r[0] <= x < r[0] + r[2] and r[1] <= y < r[1] + r[3]:
+                cur = s.id
+                break
+        ed.set_current(cur)
+
+    # правки черновика
+    def mon_set_draft(self, lay, dirty=True):
+        self.mon_draft = lay
+        self.mon_dirty = self.mon_dirty or dirty
+        if self.mon_editor and self.mon_editor.winfo_exists():
+            self.mon_editor.set_layout(lay)
+            self.mon_editor.select(self.mon_sel)
+        self.mon_paint_dirty()
+        self.mon_paint_warn()
+        self.mon_paint_props()
+
+    def mon_replace_screen(self, sid, **kw):
+        lay = self.mon_draft
+        screens = tuple(dataclasses.replace(s, **kw) if s.id == sid else s for s in lay.screens)
+        self.mon_set_draft(dataclasses.replace(lay, screens=screens))
+
+    def mon_changed(self, lay):
+        self.mon_draft, self.mon_dirty = lay, True
+        self.mon_paint_dirty()
+        self.mon_paint_warn()
+
+    def mon_selected(self, sid):
+        self.mon_rename()  # подпись прошлого экрана, набранная без Enter
+        self.mon_sel = sid
+        self.mon_paint_props()
+
+    def mon_set_hold(self, reason, on):
+        """Пока идёт перетаскивание или висит плашка отката, панель не прячется (§15)."""
+        was = bool(self.mon_hold)
+        (self.mon_hold.add if on else self.mon_hold.discard)(reason)
+        if self.mon_hold and not was:
+            self.mon_pin_prev, self.pinned = self.pinned, True
+        elif was and not self.mon_hold:
+            self.pinned = self.mon_pin_prev
+
+    def mon_rename(self):
+        ui = self.mon_ui
+        s = self.mon_screen(ui.get("label_for")) if ui else None
+        if not s or not ui or "label_ent" not in ui or not ui["label_ent"].winfo_exists():
+            return
+        new = " ".join(ui["label_var"].get().split())[:MON_LABEL_MAX]
+        if not new:
+            ui["label_var"].set(s.label)
+            return self.flash("Подпись экрана не может быть пустой", C["accent"])
+        if new != s.label:
+            self.mon_replace_screen(s.id, label=new)
+
+    def mon_apply_size(self, sid, size, source):
+        self.mon_replace_screen(sid, size_mm=(float(size[0]), float(size[1])), size_source=source)
+        s = self.mon_screen(sid)
+        if s:
+            self.flash(f"{s.label}: {layout_editor.diag_label(s.size_mm)} "
+                       f"({layout_editor.fmt_num(s.size_mm[0])} × {layout_editor.fmt_num(s.size_mm[1])} мм)")
+
+    # «Определить экраны» — список экранов этой ОС (list_displays через MonitorsCtl.local_displays)
+    @staticmethod
+    def mon_clean_displays(res):
+        """Отбросить записи не по контракту §5.2 — UI не должен падать на чужих данных."""
+        out = []
+        for d in res if isinstance(res, list) else []:
+            try:
+                px = tuple(int(v) for v in d["px"])[:2]
+                rect = tuple(int(v) for v in d["rect_px"])[:4]
+                if len(px) != 2 or len(rect) != 4:
+                    raise ValueError
+                mm = d.get("size_mm")
+                mm = (float(mm[0]), float(mm[1])) if mm else None
+                scale = d.get("scale")
+                out.append({"os_id": d.get("os_id") if isinstance(d.get("os_id"), str) else None,
+                            "label": str(d.get("label") or "").strip()[:MON_LABEL_MAX], "px": px, "rect_px": rect,
+                            "primary": bool(d.get("primary")), "scale": int(scale) if scale else None,
+                            "size_mm": mm, "virtual": bool(d.get("virtual"))})
+            except (KeyError, TypeError, ValueError, IndexError):
+                plat.log("monitors: local_displays — запись пропущена (не по контракту)")
+        return out
+
+    def mon_fetch_displays(self, merge):
+        if self.mon_detecting:
+            return
+        self.mon_detecting = True
+        btn = self.mon_ui.get("detect") if self.mon_ui else None
+        if merge and btn and btn.winfo_exists():
+            btn.configure(text="Ищу экраны…")
+
+        def done(res, err):
+            self.mon_detecting = False
+            if btn and btn.winfo_exists():
+                btn.configure(text="Определить экраны")
+            if err is not None or not isinstance(res, list):
+                if merge:
+                    self.mon_fail(res, "Экраны не определены")
+                return
+            self.mon_displays = self.mon_clean_displays(res)
+            if merge:
+                self.mon_merge_displays(self.mon_displays)
+            elif self.tab == "monitors":
+                self.mon_paint_props()
+                self.mon_track_cursor()
+        self.run_bg(self.mon_list_displays, done)
+
+    def mon_detect(self):
+        if not self.mon_this():
+            return self.flash("Сначала выбери, какой компьютер на схеме — этот", C["accent"])
+        self.mon_fetch_displays(merge=True)
+
+    @staticmethod
+    def mon_default_size(d):
+        """EDID нет — типовая диагональ (15,6″ для основного, 24″ для остальных), size_source="default" (§9.1)."""
+        return layout.size_from_diagonal(15.6 if d["primary"] else 24.0, "in", d["px"])
+
+    def mon_merge_displays(self, displays):
+        """Обновить экраны этой машины в черновике: пиксели, масштаб, os_rect_px, EDID; новые — добавить справа."""
+        lay, me = self.mon_draft, self.mon_this()
+        if not lay or not me:
+            return
+        screens = list(lay.screens)
+        index = {s.os_id: i for i, s in enumerate(screens) if s.machine == me and s.os_id}
+        used = {s.id for s in screens}
+        seen, added, updated = set(), [], 0
+        for d in displays:
+            if d["virtual"]:  # виртуальный дисплей стрима — этап 3 (§8.3)
+                continue
+            seen.add(d["os_id"])
+            if d["os_id"] in index:
+                i = index[d["os_id"]]
+                kw = {"px": d["px"], "os_rect_px": d["rect_px"], "scale": d["scale"]}
+                if d["size_mm"] and screens[i].size_source != "user":
+                    kw.update(size_mm=d["size_mm"], size_source="edid")
+                screens[i] = dataclasses.replace(screens[i], **kw)
+                updated += 1
+                continue
+            n = 1
+            while f"{me}.{n}" in used:
+                n += 1
+            sid = f"{me}.{n}"
+            used.add(sid)
+            right = max((s.pos_mm[0] + s.size_mm[0] for s in screens), default=0.0)
+            size, src = (d["size_mm"], "edid") if d["size_mm"] else (self.mon_default_size(d), "default")
+            screens.append(layout.Screen(id=sid, machine=me, label=d["label"] or f"Экран {n}", px=d["px"],
+                                         scale=d["scale"], size_mm=tuple(size), size_source=src,
+                                         pos_mm=(round(right + 20.0, 1), 0.0), os_id=d["os_id"], os_rect_px=d["rect_px"]))
+            added.append(screens[-1].label)
+        gone = [s.label for s in screens if s.machine == me and s.os_id and s.os_id not in seen]
+        self.mon_set_draft(dataclasses.replace(lay, screens=tuple(screens)), dirty=bool(updated or added))
+        parts = [f"обновлено: {updated}"] + ([f"новые: {', '.join(added)}"] if added else []) + \
+                ([f"сейчас не подключены: {', '.join(gone)}"] if gone else [])
+        self.flash(clip("Экраны: " + " · ".join(parts), 110), C["accent"] if gone or added else C["mint"])
+
+    # сохранение, раскладка ОС, копирование
+    def mon_save(self):
+        if not self.mon_draft:
+            return
+        self.mon_rename()  # подпись, набранная без Enter
+        res = self.mon_call("save_layout", self.mon_draft)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Не сохранено")
+        self.mon_save_warn = [str(w) for w in res.get("warnings") or []]
+        self.mon_draft, self.mon_dirty = self.mon_load_layout() or self.mon_draft, False
+        self.mon_refresh_snap()
+        self.mon_set_draft(self.mon_draft, dirty=False)
+        n = len(self.mon_save_warn)
+        self.flash("Раскладка сохранена" + (f" · предупреждений: {n}" if n else ""), C["accent"] if n else C["mint"])
+
+    def mon_apply_os(self):
+        if self.mon_dirty:
+            return self.flash(f"Сначала «Сохранить» — к {self.mon_os_name()} применяется сохранённая раскладка",
+                              C["accent"])
+        if self.mon_pending:
+            return self.flash("Сначала ответь на плашку сверху: оставить или вернуть", C["accent"])
+        res = self.mon_call("apply_os_positions")
+        if not self.mon_ok(res):
+            return self.mon_fail(res, f"Раскладка {self.mon_os_name()} не изменена")
+        if not res.get("token"):
+            return self.flash(f"Раскладка {self.mon_os_name()} уже совпадает со схемой")
+        self.mon_start_pending(res["token"], MON_ROLLBACK_S)
+
+    def mon_start_pending(self, token, deadline_s):
+        if (self.mon_pending and self.mon_pending["token"] == str(token)) or str(token) in self.mon_answered:
+            return
+        try:
+            left = max(1.0, float(deadline_s))
+        except (TypeError, ValueError):
+            left = float(MON_ROLLBACK_S)
+        self.mon_pending = {"token": str(token), "until": time.monotonic() + left}
+        self.mon_set_hold("rollback", True)
+        self.mon_paint_banner()
+
+    def mon_paint_banner(self):
+        """Плашка «Раскладка Windows изменена. Оставить?» с отсчётом; без ответа откат делает MonitorsCtl (§7.5)."""
+        ui = self.mon_ui
+        box = ui.get("banner") if ui else None
+        pend = self.mon_pending
+        if pend and time.monotonic() >= pend["until"]:
+            self.mon_answered.add(pend["token"])
+            self.mon_pending = pend = None
+            self.mon_set_hold("rollback", False)
+            self.flash(f"Раскладка {self.mon_os_name()} возвращена — не подтверждена за {MON_ROLLBACK_S} с", C["accent"])
+        if not box or not box.winfo_exists():
+            return
+        if not pend:
+            for w in box.winfo_children():
+                w.destroy()
+            ui.pop("banner_left", None)
+            return
+        left = max(0, int(pend["until"] - time.monotonic() + 0.99))
+        if "banner_left" not in ui or not ui["banner_left"].winfo_exists():
+            card = tk.Frame(box, bg=C["item"], highlightthickness=1, highlightbackground=C["accent"])
+            card.pack(fill="x", pady=(0, 8))
+            inner = tk.Frame(card, bg=C["item"])
+            inner.pack(fill="x", padx=10, pady=7)
+            tk.Label(inner, text=f"Раскладка {self.mon_os_name()} изменена. Оставить?", bg=C["item"], fg=C["ink"],
+                     font=self.f_bold).pack(side="left")
+            self.mon_button(inner, "Вернуть", lambda: self.mon_confirm(False)).pack(side="right")
+            keep = self.mon_button(inner, "Оставить", lambda: self.mon_confirm(True), primary=True)
+            keep.pack(side="right", padx=(0, 6))
+            ui["banner_left"] = tk.Label(inner, text="", bg=C["item"], fg=C["accent"], font=self.f_tiny, padx=8)
+            ui["banner_left"].pack(side="right")
+            keep.focus_set()
+        ui["banner_left"].configure(text=f"откат через {left} с")
+
+    def mon_confirm(self, keep):
+        pend, self.mon_pending = self.mon_pending, None
+        if pend:
+            self.mon_answered.add(pend["token"])
+        self.mon_set_hold("rollback", False)
+        self.mon_paint_banner()
+        if not pend:
+            return
+        res = self.mon_call("confirm_os_positions" if keep else "rollback_os_positions", pend["token"])
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Раскладка не подтверждена" if keep else "Не вернул")
+        self.flash(f"Раскладка {self.mon_os_name()} " + ("оставлена" if keep else "возвращена"))
+
+    def mon_copy_layout(self):
+        if self.mon_dirty:
+            return self.flash("Сначала «Сохранить» — копируется сохранённая раскладка", C["accent"])
+        text = self.mon_call("export_layout")
+        if not isinstance(text, str) or not text.strip():
+            return self.mon_fail(text, "Раскладка не скопирована")
+        self.copy(text, "Раскладка скопирована — нажми «Вставить раскладку» на другом компьютере")
+
+    def mon_paste_layout(self):
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            return self.flash("В буфере пусто — сначала «Копировать раскладку» на другом компьютере", C["accent"])
+        if self.mon_dirty and time.monotonic() - self.mon_paste_armed > 5:
+            self.mon_paste_armed = time.monotonic()
+            return self.flash("Есть несохранённые правки — нажми «Вставить» ещё раз, чтобы заменить", C["accent"])
+        res = self.mon_call("import_layout", text)
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Раскладка не вставлена")
+        self.mon_draft, self.mon_dirty, self.mon_wiz, self.mon_sel = self.mon_load_layout(), False, None, None
+        self.mon_refresh_snap()
+        self.set_tab("monitors")
+        self.flash("Раскладка вставлена")
+
+    def mon_event(self, kind, payload):
+        """События MonitorsCtl из очереди (поток Tk)."""
+        payload = payload if isinstance(payload, dict) else {}
+        open_tab = self.shown and self.tab == "monitors" and self.mon_ui
+        if kind == "os_positions_pending" and payload.get("token"):
+            self.mon_start_pending(payload["token"], payload.get("deadline_s", MON_ROLLBACK_S))
+        elif kind == "displays_changed":
+            self.mon_displays = None
+            if open_tab:
+                self.flash("Экраны изменились — нажми «Определить экраны»", C["accent"])
+                self.mon_fetch_displays(merge=False)
+        elif kind == "warning" and payload.get("text"):
+            plat.log(f"monitors: предупреждение — {clip(str(payload['text']), 120)}")
+            if open_tab:
+                self.flash(clip(str(payload["text"]), 110), C["accent"])
+        elif open_tab:  # snapshot_changed, mode_changed, deskflow_* — перерисовать статус
+            self.mon_paint_status()
+
+    # мастер первого запуска (§15.1: шаги 1, 2 и 4; второй компьютер — коротко, только для схемы)
+    def mon_wiz_new(self):
+        host = socket.gethostname() or "this-pc"
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", host.lower()).strip("-")[:63] or "laptop-a"
+
+        def var(val=""):
+            return tk.StringVar(self.root, value=val)
+        return {"step": 0, "count": 2, "hostname": host, "v_name": var(name), "displays": None, "rows": [],
+                "loading": False, "b_os": "windows", "v_b_name": var("laptop-b"), "v_b_host": var(""),
+                "v_b_label": var("Ноут B"), "v_b_diag": var("15,6"), "v_b_px": var("1920×1080"), "draft": None,
+                "sig": None}
+
+    def mon_wiz_steps(self):
+        return ["me", "screens", "peer", "arrange"] if self.mon_wiz["count"] == 2 else ["me", "screens", "arrange"]
+
+    def mon_wizard(self, area):
+        wz = self.mon_wiz
+        steps = self.mon_wiz_steps()
+        wz["step"] = min(wz["step"], len(steps) - 1)
+        key = steps[wz["step"]]
+        titles = {"me": "Этот компьютер", "screens": "Экраны этого компьютера", "peer": "Второй компьютер",
+                  "arrange": "Расставь экраны как на столе"}
+        self.mon_head(area, f"ПЕРВАЯ НАСТРОЙКА МОНИТОРОВ · ШАГ {wz['step'] + 1} ИЗ {len(steps)}")
+        box = tk.Frame(area, bg=C["item"])
+        box.pack(fill="x")
+        inner = tk.Frame(box, bg=C["item"])
+        inner.pack(fill="x", padx=12, pady=10)
+        self.mon_note(inner, titles[key], C["ink"], self.f_bold)
+        tk.Frame(inner, bg=C["item"], height=int(4 * self.s)).pack(fill="x")
+        getattr(self, f"mon_wiz_{key}")(inner)
+        self.mon_ui["wiz_err"] = tk.Label(area, text="", bg=C["bg"], fg=C["red"], font=self.f_tiny, anchor="w")
+        self.mon_ui["wiz_err"].pack(fill="x", pady=(4, 0))
+        nav = tk.Frame(area, bg=C["bg"])
+        nav.pack(fill="x", pady=(4, 8))
+        if wz["step"] > 0:
+            self.mon_button(nav, "← Назад", lambda: self.mon_wiz_go(-1)).pack(side="left")
+        last = wz["step"] == len(steps) - 1
+        self.mon_button(nav, "Готово — сохранить" if last else "Далее →",
+                        self.mon_wiz_finish if last else (lambda: self.mon_wiz_go(1)), primary=True).pack(side="right")
+
+    def mon_wiz_go(self, d):
+        if d > 0:
+            err = self.mon_wiz_check(self.mon_wiz_steps()[self.mon_wiz["step"]])
+            if err:
+                return self.mon_ui["wiz_err"].configure(text=err)
+        self.mon_wiz["step"] = max(0, self.mon_wiz["step"] + d)
+        self.set_tab("monitors")
+
+    def mon_wiz_chips(self, parent, options, current, on_pick):
+        row = tk.Frame(parent, bg=parent["bg"])
+        row.pack(fill="x", pady=(2, 6))
+        for val, text in options:
+            on = val == current
+            self.mon_button(row, ("● " if on else "○ ") + text, lambda v=val: on_pick(v),
+                            fg=C["accent"] if on else None).pack(side="left", padx=(0, 6))
+        return row
+
+    def mon_wiz_field(self, parent, label, var, width, hint=""):
+        row = tk.Frame(parent, bg=parent["bg"])
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=label, bg=parent["bg"], fg=C["muted"], font=self.f_small, width=16, anchor="w").pack(side="left")
+        ent = self.mon_entry(row, var, width)
+        ent.pack(side="left")
+        if hint:
+            tk.Label(row, text=hint, bg=parent["bg"], fg=C["muted"], font=self.f_tiny, padx=8).pack(side="left")
+        return ent
+
+    def mon_wiz_pick(self, key, val):
+        self.mon_wiz[key] = val
+        self.set_tab("monitors")
+
+    def mon_wiz_me(self, inner):
+        wz = self.mon_wiz
+        self.mon_note(inner, f"Имя в системе: {wz['hostname']}", C["ink"], self.f_small)
+        self.mon_wiz_field(inner, "Имя для схемы", wz["v_name"], 22, "латиница, цифры, точка, дефис")
+        self.mon_note(inner, "Сколько компьютеров стоит на столе?", C["ink"], self.f_small).pack_configure(pady=(8, 0))
+        self.mon_wiz_chips(inner, ((1, "1 — только этот"), (2, "2 — этот и ещё один")), wz["count"],
+                           lambda v: self.mon_wiz_pick("count", v))
+        self.mon_note(inner, "Экраны этого компьютера найдём на следующем шаге. Второй компьютер пока участвует только "
+                             "в схеме — общая мышь появится в следующей версии.")
+
+    def mon_wiz_screens(self, inner):
+        wz = self.mon_wiz
+        if wz["displays"] is None:
+            self.mon_note(inner, "Ищу экраны…", C["muted"], self.f_small)
+            if not wz["loading"]:
+                wz["loading"] = True
+
+                def done(res, err):
+                    wz["loading"] = False
+                    ds = [d for d in self.mon_clean_displays(res) if not d["virtual"]] if err is None else []
+                    if not ds:  # список не получен — хотя бы основной экран по данным окна
+                        w, h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+                        ds = [{"os_id": None, "label": "", "px": (w, h), "rect_px": (0, 0, w, h), "primary": True,
+                               "scale": None, "size_mm": None, "virtual": False, "guess": True}]
+                    wz["displays"] = ds
+                    wz["rows"] = [{"v_label": tk.StringVar(self.root, value=self.mon_default_label(d, n)),
+                                   "v_diag": tk.StringVar(self.root, value=layout_editor.fmt_num(
+                                       layout.diagonal_in(d["size_mm"])) if d["size_mm"] else "")}
+                                  for n, d in enumerate(ds, 1)]
+                    if self.mon_wiz is wz and self.tab == "monitors":
+                        self.set_tab("monitors")
+                self.run_bg(self.mon_list_displays, done)
+            return
+        if any(d.get("guess") for d in wz["displays"]):
+            self.mon_note(inner, "Список экранов получить не удалось — показан основной экран. Остальные можно "
+                                 "добавить потом кнопкой «Определить экраны».", C["accent"])
+        for d, row in zip(wz["displays"], wz["rows"]):
+            r = tk.Frame(inner, bg=C["item"])
+            r.pack(fill="x", pady=3)
+            self.mon_entry(r, row["v_label"], 16).pack(side="left")
+            info = (f"{d['px'][0]}×{d['px'][1]}" + (f" · {d['scale']} %" if d["scale"] else "")
+                    + (" · основной" if d["primary"] else "") + (f" · {d['label']}" if d["label"] else ""))
+            tk.Label(r, text=info, bg=C["item"], fg=C["muted"], font=self.f_small, padx=8).pack(side="left")
+            tk.Label(r, text="″", bg=C["item"], fg=C["muted"], font=self.f_small).pack(side="right")
+            self.mon_entry(r, row["v_diag"], 6).pack(side="right")
+            src, fg = ("из EDID", C["mint"]) if d["size_mm"] else ("введи диагональ", C["accent"])
+            tk.Label(r, text=src, bg=C["item"], fg=fg, font=self.f_tiny, padx=6).pack(side="right")
+        self.mon_note(inner, "Диагональ — в дюймах, как в характеристиках (15,6; 24; 27). Точнее — ширину и высоту "
+                             "в мм можно ввести потом в свойствах экрана.").pack_configure(pady=(6, 0))
+
+    @staticmethod
+    def mon_default_label(d, n):
+        """Подпись по умолчанию: «Ноут A» для основного экрана до 17,5″, иначе «Монитор 24″» (модель EDID — в сведениях)."""
+        diag = layout.diagonal_in(d["size_mm"]) if d["size_mm"] else None
+        if d["primary"] and (diag is None or diag <= 17.5):
+            return "Ноут A"
+        return f"Монитор {round(diag)}″" if diag else f"Монитор {n}"
+
+    def mon_wiz_peer(self, inner):
+        wz = self.mon_wiz
+        self.mon_wiz_field(inner, "Имя для схемы", wz["v_b_name"], 22, "латиница, цифры, точка, дефис")
+        self.mon_wiz_field(inner, "IP в сети", wz["v_b_host"], 22, "можно пусто — понадобится позже")
+        tk.Label(inner, text="Система", bg=C["item"], fg=C["muted"], font=self.f_small, anchor="w").pack(fill="x", pady=(4, 0))
+        self.mon_wiz_chips(inner, MON_OS, wz["b_os"], lambda v: self.mon_wiz_pick("b_os", v))
+        self.mon_wiz_field(inner, "Его экран", wz["v_b_label"], 22)
+        self.mon_wiz_field(inner, "Диагональ, ″", wz["v_b_diag"], 8)
+        self.mon_wiz_field(inner, "Разрешение", wz["v_b_px"], 12, "например 1920×1080")
+        row = tk.Frame(inner, bg=C["item"])
+        row.pack(fill="x", pady=(8, 0))
+        self.mon_button(row, "Вставить раскладку со второго компьютера", self.mon_paste_layout).pack(side="left")
+        tk.Label(row, text="если там уже настроено", bg=C["item"], fg=C["muted"], font=self.f_tiny,
+                 padx=8).pack(side="left")
+
+    @staticmethod
+    def mon_parse_px(text):
+        m = re.fullmatch(r"\s*(\d{3,5})\s*[xXхХ×*]\s*(\d{3,5})\s*", text or "")
+        if not m:
+            return None
+        w, h = int(m.group(1)), int(m.group(2))
+        return (w, h) if 320 <= w <= 16384 and 200 <= h <= 16384 else None
+
+    @staticmethod
+    def mon_wiz_diag(text):
+        d = layout_editor.parse_num(text)
+        lo, hi = layout_editor.DIAG_RANGE["in"]
+        return d if d is not None and lo <= d <= hi else None
+
+    def mon_wiz_check(self, key):
+        """Текст ошибки шага или None."""
+        wz = self.mon_wiz
+        if key == "me":
+            if not MON_NAME_RE.fullmatch(wz["v_name"].get().strip()):
+                return "Имя для схемы: 1–63 символа — латиница, цифры, точка, дефис; не начинается с дефиса"
+        elif key == "screens":
+            if wz["displays"] is None:
+                return "Подожди — ищу экраны"
+            for row in wz["rows"]:
+                if not " ".join(row["v_label"].get().split()):
+                    return "У каждого экрана нужна подпись"
+                if self.mon_wiz_diag(row["v_diag"].get()) is None:
+                    return f"«{row['v_label'].get().strip()}»: диагональ — число от 5 до 120 дюймов"
+        elif key == "peer":
+            name = wz["v_b_name"].get().strip()
+            if not MON_NAME_RE.fullmatch(name):
+                return "Имя второго компьютера: латиница, цифры, точка, дефис"
+            if name.lower() == wz["v_name"].get().strip().lower():
+                return "У компьютеров должны быть разные имена"
+            host = wz["v_b_host"].get().strip()
+            valid_host = getattr(monitor, "valid_host", None) if monitor else None
+            if host and callable(valid_host) and not valid_host(host):
+                return "IP или имя второго компьютера записаны с ошибкой"
+            if not " ".join(wz["v_b_label"].get().split()):
+                return "Подпиши экран второго компьютера"
+            if self.mon_wiz_diag(wz["v_b_diag"].get()) is None:
+                return "Диагональ экрана второго компьютера — число от 5 до 120 дюймов"
+            if self.mon_parse_px(wz["v_b_px"].get()) is None:
+                return "Разрешение — как 1920×1080"
+        return None
+
+    def mon_wiz_build(self):
+        """Черновик раскладки из ответов мастера: экраны этой машины слева направо по раскладке ОС,
+        низом на одной линии; второй компьютер — справа. Дальше пользователь двигает их сам."""
+        wz = self.mon_wiz
+        me_os = "windows" if sys.platform == "win32" else "macos"
+        machines = [layout.Machine(id="a", name=wz["v_name"].get().strip(), hostname=wz["hostname"], host=None, os=me_os)]
+        items = []
+        for n, (d, row) in enumerate(zip(wz["displays"], wz["rows"]), 1):
+            diag = self.mon_wiz_diag(row["v_diag"].get())
+            if d["size_mm"] and abs(layout.diagonal_in(d["size_mm"]) - diag) < 0.06:
+                size, src = d["size_mm"], "edid"
+            else:
+                size, src = layout.size_from_diagonal(diag, "in", d["px"]), "user"
+            items.append(dict(id=f"a.{n}", machine="a", label=" ".join(row["v_label"].get().split())[:MON_LABEL_MAX],
+                              px=d["px"], scale=d["scale"], size_mm=tuple(size), size_source=src, os_id=d["os_id"],
+                              os_rect_px=None if d.get("guess") else d["rect_px"], order=d["rect_px"][0]))
+        if wz["count"] == 2:
+            px = self.mon_parse_px(wz["v_b_px"].get())
+            machines.append(layout.Machine(id="b", name=wz["v_b_name"].get().strip(), hostname="",
+                                           host=wz["v_b_host"].get().strip() or None, os=wz["b_os"]))
+            items.append(dict(id="b.1", machine="b", label=" ".join(wz["v_b_label"].get().split())[:MON_LABEL_MAX],
+                              px=px, scale=None, size_mm=tuple(layout.size_from_diagonal(
+                                  self.mon_wiz_diag(wz["v_b_diag"].get()), "in", px)),
+                              size_source="user", os_id=None, os_rect_px=None, order=10 ** 9))
+        items.sort(key=lambda it: (it["machine"], it["order"]))
+        floor = max(it["size_mm"][1] for it in items)
+        x, screens = 0.0, []
+        for it in items:
+            it.pop("order")
+            screens.append(layout.Screen(pos_mm=(round(x, 1), round(floor - it["size_mm"][1], 1)), **it))
+            x += it["size_mm"][0] + 20.0
+        return layout.normalize(layout.Layout(machines=tuple(machines), screens=tuple(screens), revision=0, extra={}))
+
+    def mon_wiz_sig(self):
+        wz = self.mon_wiz
+        vals = [wz["count"], wz["b_os"], wz["v_name"].get()] + [r[k].get() for r in wz["rows"] for k in ("v_label", "v_diag")]
+        if wz["count"] == 2:
+            vals += [wz[k].get() for k in ("v_b_name", "v_b_host", "v_b_label", "v_b_diag", "v_b_px")]
+        return tuple(vals)
+
+    def mon_wiz_arrange(self, inner):
+        wz = self.mon_wiz
+        sig = self.mon_wiz_sig()
+        if wz["draft"] is None or wz["sig"] != sig:  # ответы на прошлых шагах изменились — собрать заново
+            try:
+                wz["draft"], wz["sig"] = self.mon_wiz_build(), sig
+            except Exception as e:
+                plat.log(f"monitors: мастер — {type(e).__name__}: {e}")
+                return self.mon_note(inner, f"Схема не собралась ({type(e).__name__}) — вернись на шаг назад",
+                                     C["red"], self.f_small)
+        self.mon_note(inner, "Курсор переходит по прямой — поставь экраны так же, как они стоят на столе: "
+                             "какой выше, какой правее. Края притягиваются друг к другу.", C["ink"], self.f_small)
+        tk.Frame(inner, bg=C["item"], height=int(6 * self.s)).pack(fill="x")
+        try:
+            ed = layout_editor.LayoutEditor(inner, colors=C, fonts=self.mon_fonts(), scale=self.s,
+                                            on_change=lambda lay: wz.update(draft=lay), on_select=lambda sid: None,
+                                            on_drag=lambda on: self.mon_set_hold("drag", on), height=260)
+        except Exception as e:
+            plat.log(f"monitors: LayoutEditor — {type(e).__name__}: {e}")
+            return self.mon_note(inner, f"Схема не построилась ({type(e).__name__})", C["red"], self.f_small)
+        ed.pack(fill="x")
+        ed.set_layout(wz["draft"])
+        self.mon_editor = ed
+        self.mon_legend(inner)
+
+    def mon_wiz_finish(self):
+        wz = self.mon_wiz
+        if not wz or wz["draft"] is None:
+            return
+        res = self.mon_call("save_layout", wz["draft"])
+        if not self.mon_ok(res):
+            return self.mon_fail(res, "Не сохранено")
+        res2 = self.mon_call("set_this_machine", "a")
+        if not self.mon_ok(res2):
+            self.mon_fail(res2, "Этот компьютер не запомнен")
+        self.mon_save_warn = [str(w) for w in res.get("warnings") or []]
+        self.mon_wiz, self.mon_sel = None, None
+        self.mon_draft, self.mon_dirty = self.mon_load_layout() or wz["draft"], False
+        self.mon_refresh_snap()
+        self.set_tab("monitors")
+        self.flash("Готово — раскладка сохранена. Помощник курсора включается внизу вкладки")
+
     def slide(self, target, withdraw=False):
         """Плавно сдвинуть окно к y=target; withdraw — по приезде спрятать окно (см. plat.WITHDRAW_WHEN_HIDDEN)."""
         if self.anim:
@@ -2436,6 +4160,10 @@ class Panel:
         self.root.after(60, self.root.focus_force)
         if self.tab in ("clip", "sessions", "downloads"):
             self.set_tab(self.tab)
+        elif self.tab == "net" and self.net_ui:  # без перестройки: идущая проверка и вывод остаются
+            self.net_refresh()
+        elif self.tab == "monitors" and self.mon_ui:  # без перестройки: черновик и выбор остаются
+            self.mon_paint_status()
 
     def hide(self):
         if not self.shown:
@@ -2511,9 +4239,21 @@ class Panel:
         self.root.after(DL_TICK, self.tick_downloads)
 
     def tick_server(self):
-        if self.shown and self.tab == "server" and self.srv_ui:
+        if self.srv_rebuild and not (self.shown and self.tab == "net" and self.net_busy):
+            self.srv_rebuild = False
+            if self.shown and self.tab == "net":
+                self.set_tab("net")
+        elif self.shown and self.tab == "net" and self.srv_ui:
             self.server_render()
         self.root.after(1000, self.tick_server)
+
+    def tick_monitors(self):
+        if self.shown and self.tab == "monitors" and self.mon_ui:
+            self.mon_paint_status()
+            self.mon_track_cursor()
+        if self.mon_pending:
+            self.mon_paint_banner()
+        self.root.after(MON_TICK, self.tick_monitors)
 
     def tick_music(self):
         if self.shown and self.tab == "music":
@@ -2564,6 +4304,11 @@ class Panel:
                     self.flash(f"{plat.HOTKEY_LABEL} занят другой программой", C["accent"])
                 elif ev == "hotkey-unavailable":
                     self.flash(f"{plat.HOTKEY_LABEL} недоступна — открывай через верхний край экрана", C["accent"])
+                elif isinstance(ev, tuple) and len(ev) == 3 and ev[0] == "monitors":  # события MonitorsCtl (§2.4)
+                    try:
+                        self.mon_event(ev[1], ev[2])
+                    except Exception as e:
+                        plat.log(f"monitors: событие {ev[1]!r} — {type(e).__name__}: {e}")
         except queue.Empty:
             pass
         self.root.after(100, self.tick_queue)
@@ -2595,9 +4340,13 @@ def demo_image(w=812, h=430):
 def self_test(tab, out):
     """Для проверки: показать панель на вкладке и сохранить скриншот.
 
-    tab: sessions | music | clip | downloads | server | notify (уведомления поверх спрятанной панели).
+    tab: sessions | music | clip | downloads | net (server — старое имя) | notify (уведомления поверх спрятанной панели).
+    net: в «Проверке» запускается ping; с --demo — ещё и traceroute (второй снимок *_trace.png, пока он идёт).
+    Внешний IP (api.ipify.org) в тесте запрашивается только с --demo, и то подменённый.
     """
-    global read_sessions, Media, monitor, downloads
+    global read_sessions, Media, monitor, downloads, netinfo, monitors_ctl
+    if tab == "server":
+        tab = "net"
     Limits.fetch = fake_limits_fetch  # в тестах API лимитов не дёргаем
     demo_mode = "--demo" in sys.argv
     fake_items = []
@@ -2686,6 +4435,152 @@ def self_test(tab, out):
         class FakeMonitorModule:
             Monitor = FakeMonitor
         monitor = FakeMonitorModule
+
+        # «Сеть»: выдуманный компьютер и результаты проверок — без внешних запросов
+        class FakeNetinfo:
+            @staticmethod
+            def local_info():
+                time.sleep(0.2)
+                return {"hostname": "OFFICE-PC-07", "gateway": "192.168.1.1", "dns": ["192.168.1.1", "1.1.1.1"],
+                        "primary_ip": "192.168.1.42", "err": None, "interfaces": [
+                            {"name": "Ethernet", "ipv4": ["192.168.1.42"], "ipv6": [], "mac": "00:00:5E:00:53:01",
+                             "up": True, "kind": "ethernet", "ssid": None},
+                            {"name": "Wi-Fi", "ipv4": ["192.168.1.57"], "ipv6": ["fe80::1"], "mac": "00:00:5E:00:53:02",
+                             "up": True, "kind": "wifi", "ssid": "Office-Demo"},
+                            {"name": "WireGuard (офис)", "ipv4": ["10.8.0.3"], "ipv6": [], "mac": None,
+                             "up": True, "kind": "vpn", "ssid": None},
+                            {"name": "Bluetooth", "ipv4": [], "ipv6": [], "mac": None, "up": False, "kind": "other",
+                             "ssid": None}]}
+
+            @staticmethod
+            def public_ip(timeout=4):
+                time.sleep(0.3)
+                return "203.0.113.45"
+
+            @staticmethod
+            def ping(host, count=4):
+                time.sleep(0.5)
+                return {"ok": True, "sent": count, "received": count, "loss_pct": 0.0, "min": 1.0, "avg": 1.4,
+                        "max": 2.1, "err": None}
+
+            @staticmethod
+            def traceroute(host, max_hops=20, on_hop=None, cancel=None):
+                route = [("192.168.1.1", 1.0), ("10.20.0.1", 4.2), (None, None), ("198.51.100.17", 11.6),
+                         ("198.51.100.94", 12.3), ("203.0.113.9", 18.8), ("192.0.2.10", 19.4)]
+                hops = []
+                for n, (ip, ms) in enumerate(route[:max_hops], 1):
+                    if cancel is not None and cancel.wait(0.4):
+                        break
+                    d = {"hop": n, "host": ip or "*", "ip": ip, "ms": ms}
+                    hops.append(d)
+                    if on_hop:
+                        on_hop(dict(d))
+                return hops
+
+            @staticmethod
+            def check_port(host, port, timeout=3):
+                return {"open": True, "ms": 12.0, "err": None}
+
+            @staticmethod
+            def dns_lookup(name):
+                return {"ipv4": ["192.0.2.10"], "ipv6": ["2001:db8::10"], "err": None}
+        netinfo = FakeNetinfo
+
+        # «Мониторы»: раскладка пользователя (§7.6) — ноут A 15,6″ 1920×1080 125 %, монитор 27″ выше и правее,
+        # ноут B 15,6″ справа. Deskflow и Apollo «не установлены», помощник выключен; ничего не запускается.
+        if layout is not None:
+            demo_monitors = {
+                "version": 1, "revision": 7,
+                "machines": [{"id": "a", "name": "laptop-a", "hostname": "LAPTOP-A", "host": "192.0.2.11", "os": "windows"},
+                             {"id": "b", "name": "laptop-b", "hostname": "LAPTOP-B", "host": "192.0.2.12", "os": "windows"}],
+                "screens": [
+                    {"id": "a.1", "machine": "a", "label": "Ноут A", "os_id": "win:SDC4161:00000000:UID4352",
+                     "px": [1920, 1080], "scale": 125, "size_mm": [345.4, 194.3], "size_source": "edid",
+                     "pos_mm": [0.0, 220.0], "os_rect_px": [0, 0, 1920, 1080]},
+                    {"id": "a.2", "machine": "a", "label": "Монитор 27″", "os_id": "win:GSM5B7F:0001E240",
+                     "px": [2560, 1440], "scale": 100, "size_mm": [597.7, 336.2], "size_source": "user",
+                     "pos_mm": [345.4, 0.0], "os_rect_px": [1920, -868, 2560, 1440]},
+                    {"id": "b.1", "machine": "b", "label": "Ноут B", "os_id": "win:BOE0A1C:00000000:UID256",
+                     "px": [1920, 1080], "scale": 125, "size_mm": [345.4, 194.3], "size_source": "edid",
+                     "pos_mm": [943.1, 230.0], "os_rect_px": [0, 0, 1920, 1080]}],
+                "edge_helper": {"enabled": False}}
+
+            class FakeMonitorsCtl:  # контракт §5.5; snapshot — как §5.5.1
+                def __init__(self, raw_cfg, config_path, data_dir, plat_mod, on_event=None):
+                    self.on_event = on_event
+                    self.lay = layout.parse_config(demo_monitors)[0]
+                    self.edge_on = self.edge_paused = False
+
+                def start(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+                def layout(self):
+                    return self.lay
+
+                def snapshot(self):
+                    return {"this_machine": "a", "mode": "off", "server": "a", "busy": False, "busy_text": "",
+                            "layout_ok": self.lay is not None, "warnings": [],
+                            "components": {
+                                "deskflow": {"state": "missing", "admin_to_install": True,
+                                             "url": "https://github.com/deskflow/deskflow/releases",
+                                             "cmd": "winget install --id Deskflow.Deskflow -e", "err": None},
+                                "apollo": {"state": "missing", "admin_to_install": True},
+                                "moonlight": {"state": "na", "note": "нужен на ноуте B"},
+                                "edge": {"state": "ok", "raw_input": True, "ease_cursor": False}},
+                            "deskflow": {"running": False, "role": None, "connected": [], "err": None},
+                            "stream": {"running": False, "virtual_display": None, "err": None},
+                            "edge": {"enabled": self.edge_on, "running": self.edge_on, "paused": self.edge_paused,
+                                     "user_paused": self.edge_paused, "warps": 132 if self.edge_on else 0,
+                                     "last_warp": None},
+                            "link": {"enabled": False, "peer_online": None, "err": None}}
+
+                def local_displays(self):
+                    return [{"os_id": "win:SDC4161:00000000:UID4352", "gdi_name": "\\\\.\\DISPLAY1", "label": "Ноут A",
+                             "px": [1920, 1080], "rect_px": [0, 0, 1920, 1080], "primary": True, "scale": 125,
+                             "size_mm": [345.4, 194.3], "virtual": False},
+                            {"os_id": "win:GSM5B7F:0001E240", "gdi_name": "\\\\.\\DISPLAY2", "label": "LG 27UL500",
+                             "px": [2560, 1440], "rect_px": [1920, -868, 2560, 1440], "primary": False, "scale": 100,
+                             "size_mm": [600.0, 340.0], "virtual": False}]
+
+                refresh_displays = local_displays
+
+                def pause_edge_helper(self, paused):
+                    self.edge_paused = bool(paused)
+                    return {"ok": True, "code": None, "err": None, "paused": self.edge_paused, "running": self.edge_on}
+
+                def save_layout(self, lay):
+                    self.lay = lay
+                    return {"ok": True, "err": None, "warnings": []}
+
+                def set_this_machine(self, machine_id):
+                    return {"ok": True, "err": None}
+
+                def set_edge_helper(self, enabled):
+                    self.edge_on = bool(enabled)
+                    return {"ok": True, "err": None}
+
+                def apply_os_positions(self):
+                    return {"ok": True, "err": None, "token": "demo", "positions": {}}
+
+                def confirm_os_positions(self, token):
+                    return {"ok": True, "err": None}
+
+                rollback_os_positions = confirm_os_positions
+
+                def export_layout(self):
+                    return json.dumps(layout.to_config(self.lay), ensure_ascii=False)
+
+                def import_layout(self, text):
+                    return {"ok": False, "code": "bad_layout", "err": "демо: вставка отключена"}
+
+            class FakeMonitorsModule:
+                MonitorsCtl = FakeMonitorsCtl
+            monitors_ctl = FakeMonitorsModule
+            if getattr(plat, "DATA_DIR", None) is None:  # фейку папка данных не нужна — ничего не пишет
+                plat.DATA_DIR = Path.home() / "MyPanel-demo"
     p = Panel(test_tab="sessions" if tab == "notify" else tab)
     if tab == "clip":
         for s in ("ls -la", "git status", "Привет! Посмотри, пожалуйста, черновик."):
@@ -2719,6 +4614,38 @@ def self_test(tab, out):
         p.pinned = True
         p.set_tab(p.tab)
         p.show()
+    net_trace_shot = tab == "net" and demo_mode and netinfo is not None
+    if tab == "net" and netinfo:
+        p.net_hist = ["192.0.2.10", "example.com", "192.168.1.1"] if demo_mode else []
+        p.net_addr.set("192.0.2.10" if demo_mode else "127.0.0.1")  # реальный режим — только локальный ping
+        p.net_port.set("443")
+        p.root.after(700, lambda: p.net_run("ping"))
+        if demo_mode:
+            p.root.after(900, p.net_public)
+            p.root.after(6300, lambda: p.net_run("trace"))
+
+    mon_extra = []  # (задержка мс, суффикс снимка, действие перед снимком)
+    if tab == "monitors" and p.mon_editor is not None:
+        def mon_demo():
+            p.mon_sel = "a.2"
+            p.mon_editor.select("a.2")
+            p.mon_selected("a.2")
+            p.mon_editor.set_current("a.1")
+            p.mon_editor.show_exit("a.1", "right", 380.0)  # низ ноута A — пустая зона: «в угол» монитора
+            if demo_mode:
+                p.mon_start_pending("demo", MON_ROLLBACK_S)  # плашка отката «Применить к Windows»
+        p.root.after(500, mon_demo)
+        if demo_mode:
+            def mon_helper_on():
+                p.mon_confirm(True)
+                p.mon_toggle_edge()  # только фейк: в демо реальный помощник не запускается
+                p.mon_editor.show_exit("a.2", "right", 300.0)  # монитор → ноут B, напротив
+                p.root.after(400, lambda: p.mon_ui and p.mon_ui["area"].master.yview_moveto(1.0))
+            def mon_wizard():
+                p.mon_ctl.lay, p.mon_draft, p.mon_wiz = None, None, None
+                p.set_tab("monitors")
+                p.root.after(300, lambda: p.mon_wiz_go(1))
+            mon_extra = [(7000, mon_helper_on, "_on"), (8500, mon_wizard, "_wizard")]
 
     def grab_to(path):
         from PIL import ImageGrab
@@ -2730,9 +4657,16 @@ def self_test(tab, out):
         if tab == "sessions":
             p.render_limits()
         grab_to(out)
-        if tab != "notify":
+        if tab != "notify" and not net_trace_shot and not mon_extra:
             p.quit()
     p.root.after(6000, shot)
+    for i, (ms, act, suffix) in enumerate(mon_extra):
+        last = i == len(mon_extra) - 1
+        p.root.after(ms, act)
+        p.root.after(ms + 1200, lambda s=suffix, last=last: (grab_to(out.replace(".png", f"{s}.png")),
+                                                             last and p.quit()))
+    if net_trace_shot:  # traceroute ещё идёт — хопы приходят по одному, на кнопке «Стоп»
+        p.root.after(8400, lambda: (grab_to(out.replace(".png", "_trace.png")), p.quit()))
     if tab == "notify":  # вторая плашка из очереди — красная «ждёт разрешения»
         p.root.after(7600, lambda: (grab_to(out.replace(".png", "_perm.png")), p.quit()))
     p.root.mainloop()

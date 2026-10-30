@@ -74,11 +74,14 @@ def valid_ssh_target(t):
     return valid_host(t)
 
 
-def _is_ipv6(h):
+def is_ipv6(h):
     try:
         return ipaddress.ip_address(h).version == 6
     except ValueError:
         return False
+
+
+_is_ipv6 = is_ipv6  # старое имя — алиас
 
 
 def _clean_name(n, fallback):
@@ -87,17 +90,20 @@ def _clean_name(n, fallback):
 
 
 # ── ping ──
-_WIN_TTL_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)[^=<\d]*TTL=", re.I)
-_MS_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)\s*(?:ms|мс)\b", re.I)
+WIN_TTL_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)[^=<\d]*TTL=", re.I)
+MS_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)\s*(?:ms|мс)\b", re.I)
 
 
-def _decode(b):
+def decode(b):
     for enc in (("oem",) if _WIN else ()) + ("utf-8",):
         try:
             return b.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
     return b.decode("latin-1")
+
+
+_WIN_TTL_RE, _MS_RE, _decode = WIN_TTL_RE, MS_RE, decode  # старые имена — алиасы
 
 
 def parse_ping(rc, out):

@@ -777,3 +777,30 @@ def clipboard_image():
     except Exception as e:
         log(f"clipboard_image: {type(e).__name__}")
         return None
+
+
+# ── Мониторы ──
+DATA_DIR = SUPPORT_DIR
+try:
+    from displays_mac import list_displays, set_display_positions, EdgeHelper, ease_cursor_setting
+except Exception as _e:
+    log(f"displays_mac: модуль недоступен ({type(_e).__name__})")
+    list_displays = set_display_positions = EdgeHelper = ease_cursor_setting = None
+
+
+def process_running(names):
+    """Какие из имён процессов (без учёта регистра) сейчас запущены. ps без shell, таймаут 2 с."""
+    want = {}
+    for n in names or ():
+        if isinstance(n, str) and n:
+            want.setdefault(n.lower(), n)
+    if not want:
+        return []
+    try:
+        out = subprocess.run(["/bin/ps", "-Ac", "-o", "comm="], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"process_running: {type(e).__name__}")
+        return []
+    found = {line.strip().lower() for line in out.splitlines()}
+    return [orig for low, orig in want.items() if low in found]

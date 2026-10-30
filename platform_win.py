@@ -539,3 +539,56 @@ def clipboard_image():
     except Exception as e:
         log(f"clipboard_image: {type(e).__name__}")
         return None
+
+
+# ── Мониторы ──
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "MyPanel"
+try:
+    from displays_win import list_displays, set_display_positions, EdgeHelper, ease_cursor_setting
+except Exception as _e:
+    log(f"displays_win: модуль недоступен ({type(_e).__name__})")
+    list_displays = set_display_positions = EdgeHelper = ease_cursor_setting = None
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+
+_th_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_th_kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+_th_kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+_th_kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+_th_kernel32.Process32FirstW.restype = wintypes.BOOL
+_th_kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+_th_kernel32.Process32NextW.restype = wintypes.BOOL
+_th_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def process_running(names):
+    """Какие из имён исполняемых файлов (без учёта регистра, «deskflow-core.exe») сейчас запущены. Toolhelp32."""
+    want = {}
+    for n in names or ():
+        if isinstance(n, str) and n:
+            want.setdefault(n.lower(), n)
+    if not want:
+        return []
+    snap = _th_kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        log(f"process_running: снимок процессов не получен ({ctypes.get_last_error()})")
+        return []
+    found = set()
+    try:
+        pe = _PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(pe)
+        ok = _th_kernel32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            exe = pe.szExeFile.lower()
+            if exe in want:
+                found.add(exe)
+            ok = _th_kernel32.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        _th_kernel32.CloseHandle(snap)
+    return [orig for low, orig in want.items() if low in found]
