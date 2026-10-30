@@ -114,7 +114,7 @@ class TestSignVerify(unittest.TestCase):
 
 class TestConfigChecks(unittest.TestCase):
     def mk(self, bind, **kw):
-        return PL.PeerLink(SECRET, "a", bind, kw.pop("port", free_port()), kw.pop("peers", {"b": "192.168.0.102"}),
+        return PL.PeerLink(SECRET, "a", bind, kw.pop("port", free_port()), kw.pop("peers", {"b": "192.168.1.20"}),
                            lambda *a: {}, **kw)
 
     def test_refuses_unspecified_public_and_names(self):
@@ -124,19 +124,19 @@ class TestConfigChecks(unittest.TestCase):
             self.assertEqual(r["code"], "bad_config", bind)
 
     def test_private_ranges(self):
-        for ip in ("10.1.2.3", "172.16.0.5", "172.31.255.1", "192.168.0.99", "169.254.1.1", "fd00::1", "fe80::1"):
+        for ip in ("10.1.2.3", "172.16.0.5", "172.31.255.1", "192.168.1.10", "169.254.1.1", "fd00::1", "fe80::1"):
             self.assertTrue(PL.is_private_ip(ip), ip)
         for ip in ("8.8.8.8", "172.32.0.1", "0.0.0.0", "224.0.0.1", "2001:db8::1", "127.0.0.1", "nonsense"):
             self.assertFalse(PL.is_private_ip(ip), ip)
         self.assertTrue(PL.is_private_ip("127.0.0.1", allow_loopback=True))
 
     def test_public_peer_or_no_peers_or_bad_secret_refused(self):
-        self.assertFalse(self.mk("192.168.0.99", peers={"b": "8.8.8.8"}).start()["ok"])
-        self.assertFalse(self.mk("192.168.0.99", peers={}).start()["ok"])
-        self.assertFalse(self.mk("192.168.0.99", peers={"a": "192.168.0.5"}).start()["ok"])   # пир с моим id
-        bad = PL.PeerLink(b"short", "a", "192.168.0.99", free_port(), {"b": "192.168.0.102"}, lambda *a: {})
+        self.assertFalse(self.mk("192.168.1.10", peers={"b": "8.8.8.8"}).start()["ok"])
+        self.assertFalse(self.mk("192.168.1.10", peers={}).start()["ok"])
+        self.assertFalse(self.mk("192.168.1.10", peers={"a": "192.168.0.5"}).start()["ok"])   # пир с моим id
+        bad = PL.PeerLink(b"short", "a", "192.168.1.10", free_port(), {"b": "192.168.1.20"}, lambda *a: {})
         self.assertFalse(bad.start()["ok"])
-        self.assertFalse(self.mk("192.168.0.99", port=80).start()["ok"])
+        self.assertFalse(self.mk("192.168.1.10", port=80).start()["ok"])
 
     def test_bind_failure_is_reported_not_raised(self):
         r = self.mk("192.168.0.250").start()      # такого адреса на машине нет

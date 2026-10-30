@@ -109,12 +109,12 @@ class TestArgv(unittest.TestCase):
     EXE = "C:/Program Files/Moonlight Game Streaming/Moonlight.exe"
 
     def test_stream(self):
-        a = S.build_argv("stream", self.EXE, "192.168.0.99", app="Monitor", resolution=(1920, 1080), fps=60)
-        self.assertEqual(a, [self.EXE, "stream", "192.168.0.99", "Monitor", "--resolution", "1920x1080",
+        a = S.build_argv("stream", self.EXE, "192.0.2.11", app="Monitor", resolution=(1920, 1080), fps=60)
+        self.assertEqual(a, [self.EXE, "stream", "192.0.2.11", "Monitor", "--resolution", "1920x1080",
                              "--fps", "60", "--display-mode", "fullscreen"])
 
     def test_stream_without_resolution_drops_flag(self):
-        a = S.build_argv("stream", self.EXE, "192.168.0.99", app="Monitor", fps=60)
+        a = S.build_argv("stream", self.EXE, "192.0.2.11", app="Monitor", fps=60)
         self.assertNotIn("--resolution", a)
         self.assertNotIn("{resolution}", a)
 
@@ -143,7 +143,7 @@ class TestArgv(unittest.TestCase):
             S.build_argv("nope", self.EXE, "h")
 
     def test_ipv6_and_hostname_hosts(self):
-        self.assertTrue(S.valid_host("192.168.0.99"))
+        self.assertTrue(S.valid_host("192.0.2.11"))
         self.assertTrue(S.valid_host("laptop-a.local"))
         self.assertFalse(S.valid_host("-evil"))
         self.assertFalse(S.valid_host("a/b"))
@@ -178,10 +178,10 @@ class TestMoonlight(unittest.TestCase):
 
     def test_start_builds_argv_no_shell(self):
         m = self.make()
-        r = m.start("192.168.0.99", "Monitor", (1920, 1080), 60)
+        r = m.start("192.0.2.11", "Monitor", (1920, 1080), 60)
         self.assertTrue(r["ok"], r)
         argv, kw = self.argvs[0]
-        self.assertEqual(argv[:4], [self.exe, "stream", "192.168.0.99", "Monitor"])
+        self.assertEqual(argv[:4], [self.exe, "stream", "192.0.2.11", "Monitor"])
         self.assertIn("1920x1080", argv)
         self.assertFalse(kw["shell"])
         self.assertEqual(kw["creationflags"], S.CREATE_NO_WINDOW | S.CREATE_NEW_PROCESS_GROUP)
@@ -199,24 +199,24 @@ class TestMoonlight(unittest.TestCase):
     def test_quick_exit_is_error(self):
         self.exit_code = 3
         m = self.make()
-        r = m.start("192.168.0.99", "Monitor")
+        r = m.start("192.0.2.11", "Monitor")
         self.assertEqual((r["ok"], r["code"]), (False, "exited"))
         self.assertIn("3", r["err"])
         self.assertFalse(m.status()["running"])
 
     def test_stop_quits_host_and_terminates_own_process(self):
         m = self.make()
-        m.start("192.168.0.99", "Monitor")
-        r = m.stop("192.168.0.99")
+        m.start("192.0.2.11", "Monitor")
+        r = m.stop("192.0.2.11")
         self.assertTrue(r["ok"] and r["stopped"])
-        self.assertEqual(self.runs, [[self.exe, "quit", "192.168.0.99"]])
+        self.assertEqual(self.runs, [[self.exe, "quit", "192.0.2.11"]])
         self.assertTrue(self.procs[0].terminated)
         self.assertFalse(m.status()["running"])
-        self.assertTrue(m.stop("192.168.0.99")["ok"])       # повторная остановка безопасна
+        self.assertTrue(m.stop("192.0.2.11")["ok"])       # повторная остановка безопасна
 
     def test_exit_event_once(self):
         m = self.make()
-        m.start("192.168.0.99", "Monitor")
+        m.start("192.0.2.11", "Monitor")
         self.procs[0].code = 0
         end = time.monotonic() + 2
         while not self.events and time.monotonic() < end:
@@ -228,7 +228,7 @@ class TestMoonlight(unittest.TestCase):
 
     def test_deliberate_stop_no_exit_event(self):
         m = self.make()
-        m.start("192.168.0.99", "Monitor")
+        m.start("192.0.2.11", "Monitor")
         m.stop(None)
         time.sleep(0.2)
         self.assertEqual(self.events, [])
