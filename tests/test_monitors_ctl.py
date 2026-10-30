@@ -841,7 +841,8 @@ class TestMonitorsCtl(unittest.TestCase):
         self.assertIn(("stop",), FakeDF.instances[0].calls[1:])
         moon = FakeMoon.instances[0]
         self.assertEqual(moon.path, "C:/fake/Moonlight.exe")
-        self.assertEqual(moon.calls[0], ("start", "192.0.2.11", "Monitor", (1920, 1080), 60))
+        starts = [c for c in moon.calls if c[0] == "start"]   # до старта — quit висящего сеанса Apollo
+        self.assertEqual(starts[0], ("start", "192.0.2.11", "Monitor", (1920, 1080), 60))
         st = s["stream"]
         self.assertEqual((st["role"], st["running"], st["waiting"]), ("client", True, False))
         self.assertEqual(s["components"]["moonlight"]["state"], "ok")
@@ -883,17 +884,15 @@ class TestMonitorsCtl(unittest.TestCase):
         self.assertEqual(FakeMoon.instances[0].calls, [])
         self.wait_until(lambda: not self.ctl.snapshot()["busy"], what="busy off")
 
-    def test_shared_refused_while_moonlight_runs(self):
+    def test_shared_on_client_quits_moonlight_and_apollo_session(self):
         self.ctl.set_this_machine("b")
         self.ctl.start()
-        moon = self.ctl._ensure_moon() or None
         self.ctl._do_find_stream(force=True)
         moon = self.ctl._ensure_moon()
         moon.alive = True
         self.ctl.set_mode("shared", "a")
-        self.assertIn("Moonlight", self.wait_event("warning")["text"])
-        self.assertEqual(self.ctl.snapshot()["mode"], "off")
-        self.assertEqual(FakeDF.instances[0].calls if FakeDF.instances else [], [])
+        self.wait_mode("shared")
+        self.assertIn(("stop", "192.0.2.11"), moon.calls)   # quit у хоста: Apollo снимает виртуальный экран
 
     def test_client_leaves_monitor_for_off_and_shared(self):
         self.enter_monitor("b")

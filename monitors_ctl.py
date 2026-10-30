@@ -1242,8 +1242,9 @@ class MonitorsCtl:
             with self._lock:
                 stray = S.virtual_display_present(self._displays, self._vmatch())
             if stray:
-                hint = (f"{self._mname(self._peer_id())} ещё показывает экран (Moonlight открыт вне режима). "
-                        f"Нажмите там «Выкл» или закройте Moonlight; со связкой это делается само.")
+                hint = (f"Apollo держит виртуальный экран — курсор уходит на него, а не на {self._mname(self._peer_id())}. "
+                        f"Закройте сеанс: в веб-интерфейсе Apollo «Закрыть приложение» или «Выкл» на "
+                        f"{self._mname(self._peer_id())} (со связкой — само).")
         return {"running": running, "role": role, "waiting": mode == "monitor" and not running,
                 "stray_stream": bool(stray),
                 "virtual_display": (vd.get("label") or vd.get("gdi_name")) if vd else None,
@@ -1386,8 +1387,8 @@ class MonitorsCtl:
             moon = self._moon
         own = moon.status().get("pid") if moon is not None else None
         stray = S.moonlight_pids(own)
-        if not stray:
-            return
+        # `quit` — всегда: Apollo после отключения Moonlight ставит сеанс на паузу и держит виртуальный экран,
+        # по которому курсор Deskflow уходит «в никуда» между ноутами
         mf = self._moon_find or {}
         host = self._layout.machine(self._host_id()) if self._layout else None
         if mf.get("ok") and host is not None and S.valid_host(host.host or ""):
@@ -1395,9 +1396,10 @@ class MonitorsCtl:
                 self._ensure_moon().stop(host.host)
             except Exception as e:
                 log(f"stray quit: {type(e).__name__}")
-        for pid in S.moonlight_pids(own):
+        for pid in S.moonlight_pids(own) if stray else []:
             D._kill_pid(pid, False)
-        log(f"закрыт Moonlight вне режима monitor: {len(stray)}")
+        if stray:
+            log(f"закрыт Moonlight вне режима monitor: {len(stray)}")
 
     def _monitor_precheck(self):
         lay = self._layout

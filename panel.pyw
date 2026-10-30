@@ -3538,7 +3538,7 @@ class Panel:
         peer_name = self.mon_machine_name(peer) if peer else "второй ноут"
         role = st.get("role")
         if mode != "monitor" and st.get("stray_stream"):
-            text, fg = "● Картинка идёт вне режима — закрой Moonlight на втором ноуте", C["red"]
+            text, fg = "● Висит виртуальный экран Apollo — мышь уходит на него", C["red"]
         elif mode != "monitor":
             text, fg = "○ Выключено", C["ink"]
         elif st.get("err"):
