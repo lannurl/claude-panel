@@ -141,6 +141,7 @@ SERVERS_MAX = 12
 CONFIG = load_config()
 CLAUDE = Path.home() / ".claude"
 HISTORY_MAX = 40
+SLIDE_OPEN_S, SLIDE_CLOSE_S = 0.22, 0.16  # длительность выезда и ухода панели
 PASSWORD_APPS = ("KeePass", "Bitwarden", "1Password", "Менеджер паролей") + tuple(plat.EXTRA_PASSWORD_APPS)
 HINT = (f"{plat.HOTKEY_LABEL} — открыть/закрыть · Esc — спрятать" if CONFIG["hotkey"]
         else f"{plat.HOTKEY_LABEL}: включи hotkey в config.json · Esc — спрятать")
@@ -822,7 +823,7 @@ class Panel:
         plat.prepare_window(self.root)  # окно без рамки, поверх всех
         self.root.configure(bg=C["line"])
         self.s = plat.ui_scale(self.root)
-        self.W, self.H = int(600 * self.s), int(660 * self.s)
+        self.W, self.H = int(560 * self.s), int(610 * self.s)
         self.x = (self.root.winfo_screenwidth() - self.W) // 2
         self.top, self.y = 0, -self.H - 4
         self.shown = self.pinned = self.by_hotkey = self.by_notify = False
@@ -830,6 +831,7 @@ class Panel:
         self.last_inside = time.time()
         self.anim = None
         self.tab = {"server": "net"}.get(test_tab, test_tab) or "sessions"  # «server» — старое имя вкладки
+        self.recent_open = False  # «Недавние» скрыты, открываются по кнопке
         self.history, self.paused = [], False
         self.clip_persist, self.clip_save_job = test_tab is None, None
         self.clip_load()
@@ -1219,7 +1221,7 @@ class Panel:
         when = tk.Label(r, text=ago(s["mtime"]), bg=C["item"], fg=C["muted"], font=self.f_tiny, padx=4)
         when.pack(side="right")
         self.ago_labels.append((when, "recent", s["id"]))
-        tk.Label(r, text=clip(s["name"], 62), bg=C["item"], fg=C["ink"], font=self.f_small, anchor="w",
+        tk.Label(r, text=clip(s["name"], 56), bg=C["item"], fg=C["ink"], font=self.f_small, anchor="w",
                  pady=3).pack(side="left", fill="x", expand=True)
         self.bind_tree(r, lambda: self.open_session(s))
 
@@ -1243,7 +1245,7 @@ class Panel:
         self.recent.refresh(s["id"] for s in self.sessions)
         self.sess_sig = self.signature()
         self.ago_labels = []
-        self.office = tk.Canvas(self.body, height=int(180 * self.s), bg=C["wall"], highlightthickness=0, bd=0, cursor="hand2")
+        self.office = tk.Canvas(self.body, height=int(160 * self.s), bg=C["wall"], highlightthickness=0, bd=0, cursor="hand2")
         self.office.pack(fill="x", padx=12, pady=(12, 8))
         self.office.bind("<Button-1>", self.office_click)
         stats = tk.Frame(self.body, bg=C["bg"])
@@ -1257,8 +1259,9 @@ class Panel:
             tk.Label(box, text=label, bg=C["item"], fg=C["muted"], font=self.f_small).pack(side="left")
         self.limits_box = tk.Frame(self.body, bg=C["item"])
         self.limits_box.pack(fill="x", padx=12, pady=(2, 6), side="bottom")
-        # живые — по высоте содержимого, но не больше ~2 строк, чтобы «Недавние» были видны
-        live = self.scroll_area(self.body, height=int(40 * self.s), key="live", max_height=int(118 * self.s))
+        # живые — по высоте содержимого; пока «Недавние» открыты — не больше ~2 строк, чтобы их было видно
+        live = self.scroll_area(self.body, height=int(40 * self.s), key="live",
+                                max_height=int((118 if self.recent_open else 200) * self.s))
         live.master.master.pack_configure(pady=(8, 2))
         if not self.sess_loaded:
             tk.Label(live, text="Ищу сессии Claude Code…", bg=C["bg"], fg=C["muted"], font=self.f_small, pady=8).pack()
@@ -1268,19 +1271,28 @@ class Panel:
         for s in self.sessions:
             self.session_row(live, s)
         recent, loaded, err = self.recent.snapshot()
-        self.section(self.body, f"НЕДАВНИЕ · за {RECENT_DAYS} дней" + (f" · {len(recent)}" if recent else ""))
-        lst = self.scroll_area(self.body, height=int(60 * self.s), key="recent")
-        if err:
-            tk.Label(lst, text=f"Недавние сессии: {err}", bg=C["bg"], fg=C["red"], font=self.f_tiny, anchor="w").pack(fill="x")
-        elif not loaded:
-            tk.Label(lst, text="Ищу прошлые сессии…", bg=C["bg"], fg=C["muted"], font=self.f_small, anchor="w").pack(fill="x")
-        elif not recent:
-            tk.Label(lst, text=f"Прошлых сессий за {RECENT_DAYS} дней нет.", bg=C["bg"], fg=C["muted"], font=self.f_small,
-                     anchor="w").pack(fill="x")
-        for s in recent:
-            self.recent_row(lst, s)
+        bar = tk.Frame(self.body, bg=C["bg"])
+        bar.pack(fill="x", padx=12, pady=(2, 3))
+        title = "Скрыть недавние" if self.recent_open else "Показать недавние"
+        self.button(bar, f"{'▾' if self.recent_open else '▸'} {title}" + (f" · {len(recent)}" if recent else ""),
+                    self.toggle_recent, small=True).pack(side="left")
+        if self.recent_open:
+            lst = self.scroll_area(self.body, height=int(60 * self.s), key="recent")
+            if err:
+                tk.Label(lst, text=f"Недавние сессии: {err}", bg=C["bg"], fg=C["red"], font=self.f_tiny, anchor="w").pack(fill="x")
+            elif not loaded:
+                tk.Label(lst, text="Ищу прошлые сессии…", bg=C["bg"], fg=C["muted"], font=self.f_small, anchor="w").pack(fill="x")
+            elif not recent:
+                tk.Label(lst, text=f"Прошлых сессий за {RECENT_DAYS} дней нет.", bg=C["bg"], fg=C["muted"], font=self.f_small,
+                         anchor="w").pack(fill="x")
+            for s in recent:
+                self.recent_row(lst, s)
         self.render_limits()
         self.limits.refresh_if_stale()
+
+    def toggle_recent(self):
+        self.recent_open = not self.recent_open
+        self.set_tab("sessions")
 
     def signature(self):
         """Что требует перестройки вкладки. Время («N мин назад») сюда не входит — его обновляет refresh_ago()."""
@@ -1313,14 +1325,13 @@ class Panel:
         for label, lim in rows:
             if not lim:
                 continue
-            used = float(lim.get("utilization") or 0)
-            left = max(0, 100 - used)
+            used = min(100, max(0, float(lim.get("utilization") or 0)))
             line = tk.Frame(box, bg=C["item"])
             line.pack(fill="x", padx=10, pady=2)
             tk.Label(line, text=label, bg=C["item"], fg=C["ink"], font=self.f_bold, width=11, anchor="w").pack(side="left")
-            col = C["red"] if left < 15 else C["accent"] if left < 40 else C["mint"]
-            tk.Label(line, text=f"осталось {left:.0f}%", bg=C["item"], fg=col, font=self.f_mono, width=14, anchor="w").pack(side="left")
-            bw, bh = int(170 * self.s), int(8 * self.s)
+            col = C["red"] if used > 85 else C["accent"] if used > 60 else C["mint"]
+            tk.Label(line, text=f"использовано {used:.0f}%", bg=C["item"], fg=col, font=self.f_mono, width=18, anchor="w").pack(side="left")
+            bw, bh = int(110 * self.s), int(8 * self.s)
             bar = tk.Canvas(line, width=bw, height=bh, bg=C["item"], highlightthickness=0)
             bar.pack(side="left", padx=6)
             bar.create_rectangle(0, 0, bw, bh, fill=C["field"], width=0)
@@ -1614,7 +1625,7 @@ class Panel:
             ui["vbox"].pack(fill="x", padx=12, pady=(12, 0), before=ui["card"])
             ui["card"].pack_configure(pady=(8, 6))
             ui["info"].pack_configure(padx=12)
-            wrap = int(540 * self.s)
+            wrap = int(500 * self.s)
         else:
             self.video_off()
             ui["vbox"].pack_forget()
@@ -1714,7 +1725,7 @@ class Panel:
         self.button(bar, "Очистить", self.clip_clear, small=True, fg=C["muted"]).pack(side="left", padx=6)
         if self.can_screenshot():
             self.button(bar, "✂ Скриншот", self.screenshot, small=True, fg=C["accent"]).pack(side="left")
-        tk.Label(bar, text="Только в памяти · пароли из менеджеров паролей не пишутся", bg=C["bg"], fg=C["muted"], font=self.f_tiny).pack(side="right")
+        tk.Label(bar, text="Хранится на диске · пароли из менеджеров не пишутся", bg=C["bg"], fg=C["muted"], font=self.f_tiny).pack(side="right")
         lst = self.scroll_area(self.body, key="clip")
         if self.paused:
             tk.Label(lst, text="Запись буфера на паузе.", bg=C["bg"], fg=C["accent"], font=self.f_base, pady=6).pack()
@@ -2962,7 +2973,7 @@ class Panel:
         tk.Label(box, text="Добавь в config.json рядом с панелью список \"servers\" — панель подхватит его сама. "
                  "\"ssh\" необязателен: без него сервер только пингуется; с ним (вход по ключу) видны "
                  "загрузка, память, диски и RAID.", bg=C["bg"], fg=C["muted"], font=self.f_small, justify="left",
-                 wraplength=int(520 * self.s)).pack(anchor="w", pady=(6, 10))
+                 wraplength=int(480 * self.s)).pack(anchor="w", pady=(6, 10))
         example = ('"servers": [\n'
                    '  {"name": "файл-сервер", "host": "192.0.2.10", "ssh": "admin@192.0.2.10"},\n'
                    '  {"name": "роутер", "host": "192.0.2.1"}\n'
@@ -3281,7 +3292,7 @@ class Panel:
 
     def mon_note(self, parent, text, fg=None, font=None):
         lb = tk.Label(parent, text=text, bg=parent["bg"], fg=fg or C["muted"], font=font or self.f_tiny, anchor="w",
-                      justify="left", wraplength=int(540 * self.s))
+                      justify="left", wraplength=int(500 * self.s))
         lb.pack(fill="x")
         return lb
 
@@ -3345,7 +3356,7 @@ class Panel:
         self.mon_legend(area)
         self.mon_props(area)
         ui["warn"] = tk.Label(area, text="", bg=C["bg"], fg=C["accent"], font=self.f_tiny, anchor="w", justify="left",
-                              wraplength=int(560 * self.s))
+                              wraplength=int(480 * self.s))
         ui["warn"].pack(fill="x", pady=(4, 0))
         row = tk.Frame(area, bg=C["bg"])
         row.pack(fill="x", pady=(6, 0))
@@ -3390,7 +3401,7 @@ class Panel:
                     cell.bind(seq, lambda e, k=key: self.mon_pick_mode(k))
             ui["modes"][key] = (cell, t, sub)
         ui["mode_line"] = tk.Label(area, text="", bg=C["bg"], fg=C["muted"], font=self.f_tiny, anchor="w",
-                                   justify="left", wraplength=int(540 * self.s))
+                                   justify="left", wraplength=int(500 * self.s))
         ui["mode_line"].pack(fill="x", pady=(2, 0))
 
     def mon_pick_mode(self, key, server=None):
@@ -3456,17 +3467,17 @@ class Panel:
             b.pack(side="left", padx=(6, 0))
             ui["df_me"][m.id] = b
         ui["df_detail"] = tk.Label(inner, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w",
-                                   justify="left", wraplength=int(540 * self.s))
+                                   justify="left", wraplength=int(500 * self.s))
         ui["df_detail"].pack(fill="x", pady=(2, 0))
         # плашка доверия: появляется, когда второй компьютер стучится с незнакомым отпечатком
         ui["df_trust"] = tk.Frame(inner, bg=C["item"], highlightthickness=1, highlightbackground=C["accent"])
         ti = tk.Frame(ui["df_trust"], bg=C["item"])
         ti.pack(fill="x", padx=8, pady=6)
         ui["df_trust_text"] = tk.Label(ti, text="", bg=C["item"], fg=C["ink"], font=self.f_small, anchor="w",
-                                       justify="left", wraplength=int(520 * self.s))
+                                       justify="left", wraplength=int(480 * self.s))
         ui["df_trust_text"].pack(fill="x")
         ui["df_trust_fp"] = tk.Label(ti, text="", bg=C["item"], fg=C["accent"], font=self.f_mono, anchor="w",
-                                     justify="left", wraplength=int(520 * self.s))
+                                     justify="left", wraplength=int(480 * self.s))
         ui["df_trust_fp"].pack(fill="x", pady=(3, 0))
         tr = tk.Frame(ti, bg=C["item"])
         tr.pack(fill="x", pady=(5, 0))
@@ -3479,11 +3490,11 @@ class Panel:
         ui["df_fp_copy"] = self.mon_button(fp_row, "Копировать", self.mon_copy_fp)
         ui["df_fp_copy"].pack(side="right")
         ui["df_fp"] = tk.Label(inner, text="", bg=C["item"], fg=C["ink"], font=self.f_mono, anchor="w", justify="left",
-                               wraplength=int(540 * self.s))
+                               wraplength=int(500 * self.s))
         ui["df_fp"].pack(fill="x")
         ui["df_install"] = tk.Frame(inner, bg=C["item"])
         ui["df_install_text"] = tk.Label(ui["df_install"], text="", bg=C["item"], fg=C["accent"], font=self.f_tiny,
-                                         anchor="w", justify="left", wraplength=int(430 * self.s))
+                                         anchor="w", justify="left", wraplength=int(390 * self.s))
         ui["df_install_text"].pack(side="left", fill="x", expand=True)
         self.mon_button(ui["df_install"], "Копировать команду", self.mon_copy_install).pack(side="right")
         self.mon_note(inner, "На втором компьютере тоже нужна панель с той же раскладкой («Копировать раскладку» → "
@@ -3505,7 +3516,7 @@ class Panel:
         ui["st_status"].pack(side="left")
         ui["st_web"] = self.mon_button(row, "Открыть Apollo", self.mon_open_apollo)
         ui["st_detail"] = tk.Label(inner, text="", bg=C["item"], fg=C["muted"], font=self.f_tiny, anchor="w",
-                                   justify="left", wraplength=int(540 * self.s))
+                                   justify="left", wraplength=int(500 * self.s))
         ui["st_detail"].pack(fill="x", pady=(2, 0))
         # связка панелей: без неё кнопка на одном ноуте не может включить Moonlight на другом
         lk = tk.Frame(inner, bg=C["item"])
@@ -3517,7 +3528,7 @@ class Panel:
         self.mon_button(lk, "Создать код", self.mon_link_new).pack(side="right", padx=(0, 6))
         ui["lk_code"] = tk.Label(inner, text="", bg=C["item"], fg=C["accent"], font=self.f_mono, anchor="w")
         ui["st_install"] = tk.Label(inner, text="", bg=C["item"], fg=C["accent"], font=self.f_tiny, anchor="w",
-                                    justify="left", wraplength=int(540 * self.s))
+                                    justify="left", wraplength=int(500 * self.s))
         self.mon_note(inner, "Ноут B становится вторым монитором этого компьютера: Apollo здесь создаёт виртуальный "
                              "экран и ставит его по схеме, Moonlight на ноуте B показывает его на весь экран. "
                              "Связка панелей нужна один раз: «Создать код» здесь → «Вставить код» на другом ноуте. "
@@ -3816,7 +3827,7 @@ class Panel:
         tk.Label(area, text="Перетаскивай мышью — края притягиваются (Shift — без привязки). Клавиатура: Tab к схеме, "
                             "пробел — следующий экран, стрелки — сдвиг на 1 см (Shift — на 1 мм).",
                  bg=area["bg"], fg=C["muted"], font=self.f_tiny, anchor="w", justify="left",
-                 wraplength=int(540 * self.s)).pack(fill="x")
+                 wraplength=int(500 * self.s)).pack(fill="x")
 
     def mon_props(self, area):
         """Свойства выбранного экрана: подпись и размер (SizeForm из layout_editor)."""
@@ -3874,7 +3885,7 @@ class Panel:
         df_text, df_col = self.mon_comp("deskflow")
         subs = {"off": ("всё выкл · мышь у каждого своя", C["muted"]),
                 "shared": (f"мышь на оба ноута · {df_text}", df_col),
-                "monitor": ("ноут B — 2-й экран (расширение)", C["muted"])}
+                "monitor": ("ноут B — второй экран", C["muted"])}
         for key, (cell, t, sub) in ui["modes"].items():
             on = key == mode
             cell.configure(highlightbackground=C["accent"] if on else C["item"])
@@ -4580,18 +4591,19 @@ class Panel:
         self.flash("Готово — раскладка сохранена. Помощник курсора включается внизу вкладки")
 
     def slide(self, target, withdraw=False):
-        """Плавно сдвинуть окно к y=target; withdraw — по приезде спрятать окно (см. plat.WITHDRAW_WHEN_HIDDEN)."""
+        """Плавно сдвинуть окно к y=target; withdraw — по приезде спрятать окно (см. plat.WITHDRAW_WHEN_HIDDEN).
+
+        Положение считается по времени, а не по кадрам: задержка таймера не даёт рывка, окно просто догоняет.
+        """
         if self.anim:
             self.root.after_cancel(self.anim)
-        step = max(8, int(self.H / 6))
+        start, began, dur = self.y, time.perf_counter(), SLIDE_OPEN_S if target > self.y else SLIDE_CLOSE_S
 
         def go():
-            if abs(self.y - target) <= step:
-                self.y = target
-            else:
-                self.y += step if target > self.y else -step
+            t = min(1.0, (time.perf_counter() - began) / dur)
+            self.y = target if t >= 1 else round(start + (target - start) * (1 - (1 - t) ** 3))  # замедление к концу
             self.root.geometry(f"+{self.x}+{self.y}")
-            self.anim = self.root.after(12, go) if self.y != target else None
+            self.anim = self.root.after(7, go) if self.y != target else None
             if self.anim is None and withdraw and not self.shown:
                 try:
                     self.root.withdraw()
@@ -4622,14 +4634,16 @@ class Panel:
             self.root.attributes("-topmost", True)
         except tk.TclError:
             pass
-        self.slide(self.top)
-        self.root.after(60, self.root.focus_force)
+        # вкладка строится до выезда, пока окно за краем: перестройка посреди анимации и давала рывок
         if self.tab in ("clip", "sessions", "downloads"):
             self.set_tab(self.tab)
         elif self.tab == "net" and self.net_ui:  # без перестройки: идущая проверка и вывод остаются
             self.net_refresh()
         elif self.tab == "monitors" and self.mon_ui:  # без перестройки: черновик и выбор остаются
             self.mon_paint_status()
+        self.root.update_idletasks()
+        self.slide(self.top)
+        self.root.after(int(SLIDE_OPEN_S * 1000) + 30, self.root.focus_force)
 
     def hide(self):
         if not self.shown:
@@ -5047,7 +5061,8 @@ def self_test(tab, out):
             monitors_ctl = FakeMonitorsModule
             if getattr(plat, "DATA_DIR", None) is None:  # фейку папка данных не нужна — ничего не пишет
                 plat.DATA_DIR = Path.home() / "MyPanel-demo"
-    p = Panel(test_tab="sessions" if tab == "notify" else tab)
+    p = Panel(test_tab="sessions" if tab in ("notify", "recent") else tab)
+    p.recent_open = tab == "recent"
     if tab == "clip":
         for s in ("ls -la", "git status", "Привет! Посмотри, пожалуйста, черновик."):
             p.push_history(s)
