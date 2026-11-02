@@ -174,6 +174,17 @@ class MonitorsCtl:
         except Exception as e:
             log(f"_remember_host: {type(e).__name__}")
 
+    def _fix_own_host(self):
+        """DHCP сменил IP этой машины — поправить раскладку, иначе Deskflow и связка слушают чужой адрес."""
+        lay, me = self._layout, self._this
+        mine = lay.machine(me) if lay is not None and me else None
+        if mine is None:
+            return
+        peer = next((m for m in lay.machines if m.id != me), None)
+        cur = D.own_address(mine.host, peer.host if peer else None)
+        if cur and cur != (mine.host or "").strip():
+            self._remember_host(me, cur)
+
     def _detect_this_machine(self):
         lay = self._layout
         if lay is None:
@@ -640,6 +651,7 @@ class MonitorsCtl:
 
     def _start_shared(self, server_id):
         """Остановить своё, затем запустить роль. Возвращает словарь результата (в рабочем потоке)."""
+        self._fix_own_host()
         lay = self._layout
         me, srv = lay.machine(self._this), lay.machine(server_id)
         if me is None or srv is None:
@@ -735,6 +747,7 @@ class MonitorsCtl:
 
     def _restore(self):
         """При запуске панели: найти Deskflow, перенять живой процесс из state.json или запустить режим заново."""
+        self._fix_own_host()
         self._sync_link()
         self._do_find_stream()
         find = self._do_find()
@@ -1249,7 +1262,7 @@ class MonitorsCtl:
                 "stray_stream": bool(stray),
                 "virtual_display": (vd.get("label") or vd.get("gdi_name")) if vd else None,
                 "positioned": bool(pos and vd is not None), "virtual_screen": self._virtual_screen_id(),
-                "app_name": self._stream_cfg().get("app_name"), "err": err, "hint": hint}
+                "app_name": S.stream_app(self._stream_cfg().get("app_name")), "err": err, "hint": hint}
 
     # ── виртуальный экран: автоматически на место по схеме ──
     def _vd_target(self, vd):
@@ -1473,9 +1486,10 @@ class MonitorsCtl:
             df = self._df
         if df is not None and df.status().get("running"):
             return _err("conflict", "Deskflow ещё работает — Moonlight и Deskflow-клиент не запускаются вместе")
+        self._stop_stray_stream()   # сеанс Desktop на паузе и открытый вручную Moonlight мешают запуску
         vs = self._layout.screen(self._virtual_screen_id())
         res = tuple(vs.px) if vs is not None and vs.machine == self._this else None   # px экрана B из раскладки
-        r = moon.start(host.host, self._stream_cfg().get("app_name") or "Monitor", res, S.DEFAULT_FPS)
+        r = moon.start(host.host, S.stream_app(self._stream_cfg().get("app_name")), res, S.DEFAULT_FPS)
         if not r.get("ok"):
             with self._lock:
                 self._mode = "off"   # Deskflow уже остановлен

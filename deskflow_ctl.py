@@ -642,6 +642,33 @@ def local_ip_for(peer_host):
     return ip if ip and not ip.startswith("127.") and ip != "0.0.0.0" else None
 
 
+def local_ipv4s():
+    """IPv4-адреса этой машины (без loopback и link-local)."""
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except (OSError, UnicodeError):
+        return []
+    ips = {i[4][0] for i in infos}
+    return sorted(ip for ip in ips if not ip.startswith(("127.", "169.254.")))
+
+
+def own_address(host, peer_host=None):
+    """Актуальный адрес этой машины: DHCP мог сменить IP из раскладки. Имя или свой IP — как есть; чужой IP — новый."""
+    h = (host or "").strip()
+    try:
+        ipaddress.ip_address(h.strip("[]"))
+    except ValueError:
+        if h:
+            return h
+    mine = local_ipv4s()
+    if h in mine:
+        return h
+    ip = local_ip_for(peer_host) if peer_host else None
+    if ip and ip in mine:
+        return ip
+    return mine[0] if len(mine) == 1 else (ip or h or None)
+
+
 def resolve_bind_host(host, peer_host=None):
     """(ip, err). Сервер никогда не слушает 0.0.0.0."""
     h = (host or "").strip()

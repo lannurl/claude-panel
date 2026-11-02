@@ -235,6 +235,7 @@ class TestMonitorsCtl(unittest.TestCase):
                    mock.patch.object(stream_ctl, "find_moonlight", return_value=dict(MOON_OK)),
                    mock.patch.object(stream_ctl, "Moonlight", FakeMoon),
                    mock.patch.object(stream_ctl, "moonlight_pids", return_value=[]),
+                   mock.patch.object(deskflow_ctl, "own_address", side_effect=lambda h, p=None: h),
                    mock.patch.object(peer_link, "PeerLink", FakeLink)):
             pt.start()
             self.addCleanup(pt.stop)
@@ -842,7 +843,7 @@ class TestMonitorsCtl(unittest.TestCase):
         moon = FakeMoon.instances[0]
         self.assertEqual(moon.path, "C:/fake/Moonlight.exe")
         starts = [c for c in moon.calls if c[0] == "start"]   # до старта — quit висящего сеанса Apollo
-        self.assertEqual(starts[0], ("start", "192.0.2.11", "Monitor", (1920, 1080), 60))
+        self.assertEqual(starts[0], ("start", "192.0.2.11", "Virtual Display", (1920, 1080), 60))
         st = s["stream"]
         self.assertEqual((st["role"], st["running"], st["waiting"]), ("client", True, False))
         self.assertEqual(s["components"]["moonlight"]["state"], "ok")
@@ -913,6 +914,12 @@ class TestMonitorsCtl(unittest.TestCase):
             self.ctl._this = "b"
             self.ctl._stop_stray_stream()
         kill.assert_called_once_with(4242, False)
+
+    def test_own_host_fixed_when_dhcp_changed_ip(self):
+        self.ctl.set_this_machine("a")
+        with mock.patch.object(deskflow_ctl, "own_address", return_value="192.0.2.77"):
+            self.ctl._fix_own_host()
+        self.assertEqual(self.ctl._layout.machine("a").host, "192.0.2.77")
 
     def test_leave_monitor_restores_previous_mode(self):
         self.ctl.set_this_machine("b")
@@ -1117,7 +1124,7 @@ class TestMonitorsCtl(unittest.TestCase):
         self.assertTrue(res["ok"], res)
         s = self.wait_mode("monitor")
         self.assertEqual(s["stream"]["role"], "client")
-        self.assertEqual(FakeMoon.instances[0].calls[0][0], "start")
+        self.assertIn("start", [c[0] for c in FakeMoon.instances[0].calls])
         time.sleep(0.1)
         self.assertEqual([r for r in lk.requests if r[1] == "set_mode"], [])
 

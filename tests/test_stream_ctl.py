@@ -272,5 +272,21 @@ class TestMoonlight(unittest.TestCase):
         self.assertEqual(m.pair("h", "abc")["code"], "bad_config")
 
 
+class TestStreamApp(unittest.TestCase):
+    def test_desktop_and_old_name_become_extend_app(self):
+        for n in ("Desktop", "desktop", "Monitor", "", None):
+            self.assertEqual(S.stream_app(n), "Virtual Display")
+        self.assertEqual(S.stream_app("My Screen"), "My Screen")
+
+
+class TestOwnAddress(unittest.TestCase):
+    def test_foreign_ip_replaced_by_current(self):
+        with mock.patch.object(D, "local_ipv4s", return_value=["192.0.2.21"]), \
+                mock.patch.object(D, "local_ip_for", return_value="192.0.2.21"):
+            self.assertEqual(D.own_address("192.0.2.99", "192.0.2.50"), "192.0.2.21")
+            self.assertEqual(D.own_address("192.0.2.21", "192.0.2.50"), "192.0.2.21")
+            self.assertEqual(D.own_address("my-laptop", "192.0.2.50"), "my-laptop")
+
+
 if __name__ == "__main__":
     unittest.main()

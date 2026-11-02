@@ -38,6 +38,15 @@ MOONLIGHT_NAMES = ("moonlight.exe", "moonlight", "moonlight-qt")
 APOLLO_NAMES = ("sunshine.exe", "apollo.exe")
 SUNSHINE_NAMES = ("sunshine.exe", "sunshine")
 DEFAULT_MATCH = ("SudoMaker", "SudoVDA", "Virtual Display")
+EXTEND_APP = "Virtual Display"   # встроенное приложение Apollo: создаёт виртуальный экран (расширение)
+_NOT_EXTEND_APPS = ("desktop", "monitor")   # Desktop повторяет экран; Monitor — старое имя, в Apollo его нет
+
+
+def stream_app(name):
+    """Имя приложения Apollo для режима «Ноут как монитор»: всегда то, что расширяет экран."""
+    n = (name or "").strip()
+    return EXTEND_APP if not n or n.lower() in _NOT_EXTEND_APPS else n
+
 
 # НП: синтаксис moonlight-qt по документации. Пары [флаг, значение] с пустым значением отбрасываются.
 MOONLIGHT_ARGV = {
