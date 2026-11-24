@@ -39,6 +39,12 @@ from pathlib import Path
 
 from PIL import Image, ImageTk
 
+try:   # 3D-офис агентов (готовые кадры в assets/office); без него — прежний плоский офис
+    import office3d
+    OFFICE3D = office3d.ASSETS.joinpath("office.json").exists()
+except Exception:
+    office3d, OFFICE3D = None, False
+
 if sys.platform == "win32":
     import platform_win as plat
 else:
@@ -464,7 +470,8 @@ def read_agents(sid, done=None):
                 done.add(aid)
             continue
         agents.append({"id": aid, "desc": m.get("description") or m.get("agentType") or "агент",
-                       "type": agent_label(m), "busy": age < 90})
+                       "type": agent_label(m), "kind": (m.get("agentType") or m.get("subagent_type") or "").strip(),
+                       "busy": age < 90})
     return agents
 
 
@@ -837,6 +844,7 @@ class Panel:
         self.clip_load()
         self.clip_seq = plat.clipboard_seq(self.root)
         self.sessions, self.sess_sig, self.hits = [], None, []
+        self.office3d, self.team = None, None    # живой 3D-офис (переживает перестройку вкладки)
         self.scroll_pos, self.ago_labels = {}, []
         self.office = self.limits_box = self.music_ui = None
         self.mirror, self.mirror_on, self.mirror_broken = None, False, VideoMirror is None
@@ -1245,9 +1253,17 @@ class Panel:
         self.recent.refresh(s["id"] for s in self.sessions)
         self.sess_sig = self.signature()
         self.ago_labels = []
-        self.office = tk.Canvas(self.body, height=int(160 * self.s), bg=C["wall"], highlightthickness=0, bd=0, cursor="hand2")
+        self.office = tk.Canvas(self.body, height=int((270 if OFFICE3D else 160) * self.s), bg=C["wall"], highlightthickness=0, bd=0, cursor="hand2")
         self.office.pack(fill="x", padx=12, pady=(12, 8))
-        self.office.bind("<Button-1>", self.office_click)
+        if OFFICE3D:   # офис больше окна: перетаскивание двигает, короткий клик по агенту — открыть его сессию
+            self.office.bind("<ButtonPress-1>", lambda e: self.office3d and self.office3d.press(e.x, e.y))
+            self.office.bind("<B1-Motion>", lambda e: self.office3d and self.office3d.move(e.x, e.y))
+            self.office.bind("<Motion>", lambda e: self.office3d and self.office3d.move(e.x, e.y))
+            self.office.bind("<ButtonRelease-1>", self.office3d_release)
+            # колесо: отдалить/приблизить офис (и не прокручивать панель)
+            self.office.bind("<MouseWheel>", lambda e: (self.office3d and self.office3d.wheel(e.x, e.y, e.delta), "break")[1])
+        else:
+            self.office.bind("<Button-1>", self.office_click)
         stats = tk.Frame(self.body, bg=C["bg"])
         stats.pack(fill="x", padx=12)
         n, busy = len(self.sessions), sum(s["busy"] for s in self.sessions)
@@ -1351,10 +1367,33 @@ class Panel:
                 self.open_session(s)
                 return
 
+    def office3d_release(self, e):
+        o = self.office3d
+        if o and o.release(e.x, e.y):
+            p = o.at(e.x, e.y)
+            if p and p.session:
+                self.open_session(p.session)
+
+    def draw_office3d(self):
+        """3D-офис: клодики команды живут своей жизнью, работающие сидят за ноутбуками."""
+        global OFFICE3D
+        try:
+            if self.office3d is None:
+                self.office3d = office3d.Office(self.office, self.s, self.f_tiny, self.f_bold)
+                self.team = office3d.team_kinds()
+            self.office3d.cv = self.office
+            self.office3d.update(office3d.people_from_sessions(self.sessions, MAIN_AGENT, self.team))
+            self.office3d.draw()
+        except Exception as ex:   # что-то не так с кадрами — до перезапуска рисуем прежний офис
+            print("office3d:", repr(ex), file=sys.stderr)
+            OFFICE3D = False
+
     def draw_office(self):
         cv = self.office
         if not cv or not cv.winfo_exists():
             return
+        if OFFICE3D:
+            return self.draw_office3d()
         cv.delete("all")
         w, h, s = cv.winfo_width(), cv.winfo_height(), self.s
         if w < 50:
@@ -4682,7 +4721,7 @@ class Panel:
         if self.shown and self.tab == "sessions" and self.office:
             self.frame += 1
             self.draw_office()
-        self.root.after(160, self.tick_office)
+        self.root.after(90 if OFFICE3D else 160, self.tick_office)
 
     def tick_sessions(self):
         """Сессии читаем всегда (уведомления нужны и при спрятанной панели) — в фоновом потоке:

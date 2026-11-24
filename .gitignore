@@ -12,3 +12,7 @@ config.json
 # снимки самотестов (кроме скриншота для README)
 *.png
 !docs/screenshot.png
+# кадры 3D-офиса нужны в репозитории
+!assets/office/*.png
+# пробные кадры генератора
+tools/office3d/preview/
